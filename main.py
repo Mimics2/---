@@ -2,24 +2,29 @@ import os
 import asyncio
 import logging
 import sqlite3
-import json
+import re
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import Message
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 import aiohttp
 from aiohttp import web
 
 # Конфигурация для Railway
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_IDS = [int(x.strip()) for x in os.getenv('ADMIN_IDS', '').split(',') if x.strip()]
+SESSION_STRING = os.getenv('SESSION_STRING')
 PORT = int(os.getenv('PORT', 8080))
 
 # Проверка обязательных переменных
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не установлен")
+if not SESSION_STRING:
+    raise ValueError("SESSION_STRING не установлен")
 
 # Настройка логирования
 logging.basicConfig(
@@ -35,93 +40,70 @@ bot = Bot(
 )
 dp = Dispatcher()
 
+# Инициализация Telethon клиента
+telethon_client = TelegramClient(
+    StringSession(SESSION_STRING),
+    api_id=2040,  # Стандартный API ID для Telethon
+    api_hash='b18441a1ff607e10a989891a5462e627'  # Стандартный API Hash
+)
+
 def init_db():
-    """Инициализация базы данных для многопользовательской работы"""
+    """Инициализация базы данных"""
     try:
         db_path = '/data/monitoring.db' if os.path.exists('/data') else 'monitoring.db'
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
         
-        # Пользователи и их сессии
+        # Ключевые слова для фильтрации
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
+            CREATE TABLE IF NOT EXISTS keywords (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER UNIQUE,
-                username TEXT,
-                first_name TEXT,
+                keyword TEXT UNIQUE,
                 is_active BOOLEAN DEFAULT 1,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         
-        # Сессии пользователей (аккаунты для мониторинга)
+        # Все найденные сообщения
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS user_sessions (
+            CREATE TABLE IF NOT EXISTS all_messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                session_name TEXT,
-                api_id INTEGER,
-                api_hash TEXT,
-                phone_number TEXT,
-                is_active BOOLEAN DEFAULT 1,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users (user_id)
-            )
-        ''')
-        
-        # Ключевые слова для каждого пользователя
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS user_keywords (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                keyword TEXT,
-                is_active BOOLEAN DEFAULT 1,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(user_id, keyword),
-                FOREIGN KEY (user_id) REFERENCES users (user_id)
-            )
-        ''')
-        
-        # Отслеживаемые чаты для каждого пользователя
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS user_monitored_chats (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
+                message_id INTEGER,
                 chat_id TEXT,
                 chat_name TEXT,
-                is_active BOOLEAN DEFAULT 1,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(user_id, chat_id),
-                FOREIGN KEY (user_id) REFERENCES users (user_id)
-            )
-        ''')
-        
-        # Найденные сообщения
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS found_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                session_id INTEGER,
-                chat_name TEXT,
+                user_id TEXT,
                 username TEXT,
                 message_text TEXT,
+                has_keywords BOOLEAN DEFAULT 0,
                 keywords_found TEXT,
-                source_type TEXT,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users (user_id)
+                message_type TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         
-        # Добавляем админов как пользователей
-        for admin_id in ADMIN_IDS:
-            cursor.execute(
-                "INSERT OR IGNORE INTO users (user_id, username, first_name) VALUES (?, ?, ?)",
-                (admin_id, f"admin_{admin_id}", "Administrator")
+        # Статистика чатов
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS chat_stats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id TEXT UNIQUE,
+                chat_name TEXT,
+                message_count INTEGER DEFAULT 0,
+                last_activity TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
+        ''')
+        
+        # Добавляем начальные ключевые слова
+        initial_keywords = [
+            'тест', 'мониторинг', 'ключевое слово', 'проверка',
+            'важно', 'срочно', 'внимание', 'алерт', 'тревога'
+        ]
+        for keyword in initial_keywords:
+            cursor.execute("INSERT OR IGNORE INTO keywords (keyword) VALUES (?)", (keyword,))
         
         conn.commit()
         conn.close()
-        logger.info("✅ Многопользовательская БД инициализирована")
+        logger.info("✅ База данных инициализирована")
         
     except Exception as e:
         logger.error(f"❌ Ошибка инициализации БД: {e}")
@@ -131,393 +113,430 @@ def get_db_connection():
     db_path = '/data/monitoring.db' if os.path.exists('/data') else 'monitoring.db'
     return sqlite3.connect(db_path, check_same_thread=False)
 
-def get_user_keywords(user_id: int):
-    """Получение ключевых слов пользователя"""
+def get_keywords():
+    """Получение всех ключевых слов"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT keyword FROM user_keywords WHERE user_id = ? AND is_active = 1", (user_id,))
+        cursor.execute("SELECT keyword FROM keywords WHERE is_active = 1")
         keywords = {row[0].lower() for row in cursor.fetchall()}
         conn.close()
         return keywords
     except Exception as e:
-        logger.error(f"Ошибка получения ключевых слов для {user_id}: {e}")
+        logger.error(f"Ошибка получения ключевых слов: {e}")
         return set()
 
-def get_user_chats(user_id: int):
-    """Получение чатов пользователя"""
+def save_message(message_data):
+    """Сохранение сообщения в базу"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT chat_id FROM user_monitored_chats WHERE user_id = ? AND is_active = 1", (user_id,))
-        chats = {row[0] for row in cursor.fetchall()}
-        conn.close()
-        return chats
-    except Exception as e:
-        logger.error(f"Ошибка получения чатов для {user_id}: {e}")
-        return set()
-
-def add_user(user_id: int, username: str, first_name: str):
-    """Добавление нового пользователя"""
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT OR REPLACE INTO users (user_id, username, first_name, is_active) VALUES (?, ?, ?, 1)",
-            (user_id, username, first_name)
-        )
+        
+        cursor.execute('''
+            INSERT INTO all_messages 
+            (message_id, chat_id, chat_name, user_id, username, message_text, has_keywords, keywords_found, message_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            message_data['message_id'],
+            message_data['chat_id'],
+            message_data['chat_name'],
+            message_data['user_id'],
+            message_data['username'],
+            message_data['message_text'],
+            message_data['has_keywords'],
+            message_data['keywords_found'],
+            message_data['message_type']
+        ))
+        
+        # Обновляем статистику чата
+        cursor.execute('''
+            INSERT OR REPLACE INTO chat_stats 
+            (chat_id, chat_name, message_count, last_activity)
+            VALUES (?, ?, COALESCE((SELECT message_count FROM chat_stats WHERE chat_id = ?), 0) + 1, CURRENT_TIMESTAMP)
+        ''', (message_data['chat_id'], message_data['chat_name'], message_data['chat_id']))
+        
         conn.commit()
         conn.close()
-        logger.info(f"✅ Добавлен пользователь: {user_id} - {first_name}")
-        return True
+        
     except Exception as e:
-        logger.error(f"Ошибка добавления пользователя {user_id}: {e}")
-        return False
+        logger.error(f"Ошибка сохранения сообщения: {e}")
 
-def is_user_allowed(user_id: int):
-    """Проверка доступа пользователя"""
-    return user_id in ADMIN_IDS  # Или можно сделать систему приглашений
+async def check_keywords(text):
+    """Проверка текста на ключевые слова"""
+    if not text:
+        return False, []
+    
+    keywords = get_keywords()
+    text_lower = text.lower()
+    found_keywords = [kw for kw in keywords if kw in text_lower]
+    
+    return len(found_keywords) > 0, found_keywords
 
 # Команды бота
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    user_id = message.from_user.id
-    
-    # Автоматически добавляем пользователя при старте
-    add_user(user_id, message.from_user.username, message.from_user.first_name)
-    
-    if not is_user_allowed(user_id):
-        await message.answer(
-            "👋 <b>Добро пожаловать!</b>\n\n"
-            "🔍 <b>Это бот мониторинга сообщений</b>\n\n"
-            "Чтобы начать работу:\n"
-            "1. Добавьте ключевые слова: /add_keyword\n"
-            "2. Добавьте чаты для мониторинга: /add_chat\n"
-            "3. Настройте сессии для мониторинга каналов: /add_session\n\n"
-            "⚡ <b>Каждый пользователь работает со своими настройками!</b>"
-        )
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("❌ Доступ запрещен")
         return
     
     await message.answer(
-        "👋 <b>Добро пожаловать, администратор!</b>\n\n"
-        "🔍 <b>Система многопользовательского мониторинга</b>\n\n"
-        "<b>Основные команды:</b>\n"
+        "🔍 <b>Система мониторинга всех сообщений</b>\n\n"
+        "⚡ <b>Бот мониторит ВСЕ сообщения из ВСЕХ чатов и каналов</b>\n\n"
+        "<b>Команды:</b>\n"
         "/add_keyword - добавить ключевое слово\n"
-        "/keywords - мои ключевые слова\n"
-        "/add_chat - добавить чат для мониторинга\n"
-        "/chats - мои чаты\n"
-        "/add_session - добавить сессию для мониторинга каналов\n"
-        "/stats - моя статистика\n"
-        "/logs - мои последние находки\n\n"
-        "⚡ <b>Каждый пользователь имеет свои настройки!</b>"
+        "/keywords - список ключевых слов\n"
+        "/stats - общая статистика\n"
+        "/chats - активные чаты\n"
+        "/alerts - сообщения с ключевыми словами\n"
+        "/recent - последние сообщения\n"
+        "/search - поиск по сообщениям\n\n"
+        "🚨 <b>Мониторинг работает в реальном времени!</b>"
     )
 
 @dp.message(Command("add_keyword"))
 async def cmd_add_keyword(message: Message):
-    user_id = message.from_user.id
-    add_user(user_id, message.from_user.username, message.from_user.first_name)
-    
-    args = message.text.split()
-    if len(args) < 2:
-        await message.answer("❌ <b>Использование:</b> /add_keyword <слово или фраза>")
+    if message.from_user.id not in ADMIN_IDS:
         return
     
-    keyword = ' '.join(args[1:]).strip().lower()
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("❌ Используйте: /add_keyword <слово или фраза>")
+        return
+    
+    keyword = args[1].strip()
     
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute(
-            "INSERT OR IGNORE INTO user_keywords (user_id, keyword) VALUES (?, ?)",
-            (user_id, keyword)
-        )
+        cursor.execute("INSERT OR IGNORE INTO keywords (keyword) VALUES (?)", (keyword,))
         conn.commit()
         conn.close()
         
-        await message.answer(f"✅ <b>Ключевое слово добавлено:</b> <code>{keyword}</code>")
-        logger.info(f"Пользователь {user_id} добавил ключевое слово: {keyword}")
+        await message.answer(f"✅ Ключевое слово добавлено: <code>{keyword}</code>")
+        logger.info(f"Добавлено ключевое слово: {keyword}")
         
     except Exception as e:
-        logger.error(f"Ошибка добавления ключевого слова для {user_id}: {e}")
-        await message.answer("❌ Ошибка при добавлении ключевого слова")
+        logger.error(f"Ошибка добавления ключевого слова: {e}")
+        await message.answer("❌ Ошибка при добавлении")
 
 @dp.message(Command("keywords"))
 async def cmd_keywords(message: Message):
-    user_id = message.from_user.id
-    keywords = get_user_keywords(user_id)
-    
-    if keywords:
-        text = "🔍 <b>Ваши ключевые слова:</b>\n\n" + "\n".join(f"• {kw}" for kw in sorted(keywords))
-        await message.answer(text)
-    else:
-        await message.answer(
-            "📝 <b>У вас пока нет ключевых слов</b>\n\n"
-            "Добавьте их командой:\n"
-            "<code>/add_keyword ваше_слово</code>"
-        )
-
-@dp.message(Command("add_chat"))
-async def cmd_add_chat(message: Message):
-    user_id = message.from_user.id
-    add_user(user_id, message.from_user.username, message.from_user.first_name)
-    
-    chat_id = str(message.chat.id)
-    chat_name = message.chat.title or f"ЛС: {message.from_user.full_name}"
-    
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT OR REPLACE INTO user_monitored_chats (user_id, chat_id, chat_name) VALUES (?, ?, ?)",
-            (user_id, chat_id, chat_name)
-        )
-        conn.commit()
-        conn.close()
-        
-        await message.answer(
-            f"✅ <b>Чат добавлен в мониторинг:</b>\n"
-            f"📁 <b>Название:</b> {chat_name}\n"
-            f"🆔 <b>ID:</b> <code>{chat_id}</code>"
-        )
-        logger.info(f"Пользователь {user_id} добавил чат: {chat_name}")
-        
-    except Exception as e:
-        logger.error(f"Ошибка добавления чата для {user_id}: {e}")
-        await message.answer("❌ Ошибка при добавлении чата")
-
-@dp.message(Command("chats"))
-async def cmd_chats(message: Message):
-    user_id = message.from_user.id
-    
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT chat_name, chat_id FROM user_monitored_chats WHERE user_id = ? AND is_active = 1",
-            (user_id,)
-        )
-        chats = cursor.fetchall()
-        conn.close()
-        
-        if chats:
-            text = "📁 <b>Ваши чаты для мониторинга:</b>\n\n"
-            for chat_name, chat_id in chats:
-                text += f"• {chat_name}\n  <code>ID: {chat_id}</code>\n\n"
-            await message.answer(text)
-        else:
-            await message.answer(
-                "📝 <b>У вас пока нет чатов для мониторинга</b>\n\n"
-                "Добавьте текущий чат командой:\n"
-                "<code>/add_chat</code>"
-            )
-            
-    except Exception as e:
-        logger.error(f"Ошибка получения чатов для {user_id}: {e}")
-        await message.answer("❌ Ошибка получения списка чатов")
-
-@dp.message(Command("add_session"))
-async def cmd_add_session(message: Message):
-    user_id = message.from_user.id
-    add_user(user_id, message.from_user.username, message.from_user.first_name)
-    
-    await message.answer(
-        "🔐 <b>Добавление сессии для мониторинга каналов</b>\n\n"
-        "Для мониторинга каналов нужно добавить сессию Telegram.\n\n"
-        "📝 <b>Инструкция:</b>\n"
-        "1. Получите API_ID и API_HASH на https://my.telegram.org\n"
-        "2. Отправьте команду в формате:\n"
-        "<code>/session_data название_сессии ваш_api_id ваш_api_hash ваш_номер_телефона</code>\n\n"
-        "Пример:\n"
-        "<code>/session_data моя_сессия 12345678 abcdef1234567890 +79123456789</code>\n\n"
-        "⚠️ <b>Внимание:</b> Номер телефона должен быть с кодом страны"
-    )
-
-@dp.message(Command("session_data"))
-async def cmd_session_data(message: Message):
-    user_id = message.from_user.id
-    
-    args = message.text.split()
-    if len(args) < 5:
-        await message.answer("❌ <b>Недостаточно параметров</b>\n\nИспользуйте: /session_data название api_id api_hash номер_телефона")
+    if message.from_user.id not in ADMIN_IDS:
         return
     
-    session_name = args[1]
-    api_id = args[2]
-    api_hash = args[3]
-    phone_number = args[4]
-    
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO user_sessions (user_id, session_name, api_id, api_hash, phone_number) VALUES (?, ?, ?, ?, ?)",
-            (user_id, session_name, api_id, api_hash, phone_number)
-        )
-        conn.commit()
-        conn.close()
-        
-        await message.answer(
-            f"✅ <b>Сессия добавлена!</b>\n\n"
-            f"📝 <b>Название:</b> {session_name}\n"
-            f"🆔 <b>API ID:</b> {api_id}\n"
-            f"🔑 <b>API Hash:</b> {api_hash[:10]}...\n"
-            f"📞 <b>Телефон:</b> {phone_number}\n\n"
-            f"Теперь вы можете мониторить каналы через эту сессию!"
-        )
-        logger.info(f"Пользователь {user_id} добавил сессию: {session_name}")
-        
-    except Exception as e:
-        logger.error(f"Ошибка добавления сессии для {user_id}: {e}")
-        await message.answer("❌ Ошибка при добавлении сессии")
+    keywords = list(get_keywords())
+    if keywords:
+        text = "🔍 <b>Ключевые слова для мониторинга:</b>\n\n" + "\n".join(f"• {kw}" for kw in sorted(keywords))
+        await message.answer(text)
+    else:
+        await message.answer("📝 Ключевые слова не добавлены")
 
 @dp.message(Command("stats"))
 async def cmd_stats(message: Message):
-    user_id = message.from_user.id
+    if message.from_user.id not in ADMIN_IDS:
+        return
     
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # Статистика пользователя
-        cursor.execute("SELECT COUNT(*) FROM user_keywords WHERE user_id = ?", (user_id,))
-        kw_count = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM all_messages")
+        total_messages = cursor.fetchone()[0]
         
-        cursor.execute("SELECT COUNT(*) FROM user_monitored_chats WHERE user_id = ?", (user_id,))
-        chats_count = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM all_messages WHERE has_keywords = 1")
+        alert_messages = cursor.fetchone()[0]
         
-        cursor.execute("SELECT COUNT(*) FROM user_sessions WHERE user_id = ?", (user_id,))
-        sessions_count = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM chat_stats")
+        total_chats = cursor.fetchone()[0]
         
-        cursor.execute("SELECT COUNT(*) FROM found_messages WHERE user_id = ?", (user_id,))
-        found_count = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM keywords")
+        total_keywords = cursor.fetchone()[0]
         
-        cursor.execute(
-            "SELECT keywords_found, COUNT(*) FROM found_messages WHERE user_id = ? GROUP BY keywords_found ORDER BY COUNT(*) DESC LIMIT 5",
-            (user_id,)
-        )
+        cursor.execute("SELECT chat_name, message_count FROM chat_stats ORDER BY message_count DESC LIMIT 10")
+        top_chats = cursor.fetchall()
+        
+        cursor.execute("SELECT keywords_found, COUNT(*) FROM all_messages WHERE has_keywords = 1 GROUP BY keywords_found ORDER BY COUNT(*) DESC LIMIT 10")
         top_keywords = cursor.fetchall()
         
         conn.close()
         
         stats_text = (
-            f"📊 <b>Ваша статистика мониторинга</b>\n\n"
-            f"🔍 <b>Ключевых слов:</b> {kw_count}\n"
-            f"📁 <b>Чатов:</b> {chats_count}\n"
-            f"🔐 <b>Сессий:</b> {sessions_count}\n"
-            f"💬 <b>Найдено сообщений:</b> {found_count}\n\n"
+            f"📊 <b>Статистика мониторинга</b>\n\n"
+            f"💬 <b>Всего сообщений:</b> {total_messages}\n"
+            f"🚨 <b>Сообщений с ключами:</b> {alert_messages}\n"
+            f"📁 <b>Активных чатов:</b> {total_chats}\n"
+            f"🔍 <b>Ключевых слов:</b> {total_keywords}\n\n"
         )
         
+        if top_chats:
+            stats_text += "🏆 <b>Топ чатов по активности:</b>\n"
+            for chat_name, count in top_chats:
+                stats_text += f"• {chat_name}: {count} сообщ.\n"
+        
         if top_keywords:
-            stats_text += "🏆 <b>Ваши топ ключи:</b>\n"
+            stats_text += "\n🔝 <b>Топ ключевых слов:</b>\n"
             for keyword, count in top_keywords:
                 stats_text += f"• {keyword}: {count}\n"
         
         await message.answer(stats_text)
         
     except Exception as e:
-        logger.error(f"Ошибка получения статистики для {user_id}: {e}")
+        logger.error(f"Ошибка получения статистики: {e}")
         await message.answer("❌ Ошибка получения статистики")
 
-@dp.message(Command("logs"))
-async def cmd_logs(message: Message):
-    user_id = message.from_user.id
+@dp.message(Command("chats"))
+async def cmd_chats(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
     
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("""
-            SELECT chat_name, keywords_found, message_text, timestamp 
-            FROM found_messages 
-            WHERE user_id = ?
-            ORDER BY timestamp DESC 
-            LIMIT 8
-        """, (user_id,))
-        logs = cursor.fetchall()
+        cursor.execute("SELECT chat_name, message_count, last_activity FROM chat_stats ORDER BY message_count DESC LIMIT 15")
+        chats = cursor.fetchall()
         conn.close()
         
-        if logs:
-            text = "📋 <b>Ваши последние находки:</b>\n\n"
-            for chat, keywords, msg, time in logs:
-                time_str = datetime.strptime(time, '%Y-%m-%d %H:%M:%S').strftime('%H:%M')
-                text += f"📁 {chat}\n🔍 {keywords}\n💬 {msg[:40]}...\n⏰ {time_str}\n━━━━━━━━━━━━━━\n"
+        if chats:
+            text = "📁 <b>Активные чаты:</b>\n\n"
+            for chat_name, count, last_active in chats:
+                time_ago = datetime.now() - datetime.strptime(last_active, '%Y-%m-%d %H:%M:%S')
+                hours_ago = int(time_ago.total_seconds() / 3600)
+                text += f"• {chat_name}\n  📊 {count} сообщ. | ⏰ {hours_ago}ч. назад\n\n"
             await message.answer(text)
         else:
-            await message.answer("📝 <b>Пока ничего не найдено</b>\n\nСообщения появятся здесь, когда система найдет ваши ключевые слова.")
+            await message.answer("📝 Чаты не найдены")
             
     except Exception as e:
-        logger.error(f"Ошибка получения логов для {user_id}: {e}")
-        await message.answer("❌ Ошибка получения логов")
+        logger.error(f"Ошибка получения чатов: {e}")
+        await message.answer("❌ Ошибка получения списка чатов")
 
-# Основной мониторинг сообщений
-@dp.message(F.text)
-async def monitor_all_messages(message: Message):
-    """Мониторинг всех сообщений для всех пользователей"""
+@dp.message(Command("alerts"))
+async def cmd_alerts(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
     
     try:
-        user_id = message.from_user.id
-        text = message.text.lower()
-        
-        # Получаем всех пользователей, которые отслеживают этот чат
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT DISTINCT u.user_id 
-            FROM users u 
-            JOIN user_monitored_chats umc ON u.user_id = umc.user_id 
-            WHERE umc.chat_id = ? AND u.is_active = 1
-        """, (str(message.chat.id),))
-        
-        users_to_check = [row[0] for row in cursor.fetchall()]
+            SELECT chat_name, username, message_text, keywords_found, timestamp 
+            FROM all_messages 
+            WHERE has_keywords = 1 
+            ORDER BY timestamp DESC 
+            LIMIT 10
+        """)
+        alerts = cursor.fetchall()
         conn.close()
         
-        # Проверяем для каждого пользователя
-        for check_user_id in users_to_check:
-            user_keywords = get_user_keywords(check_user_id)
-            found_keywords = [kw for kw in user_keywords if kw in text]
-            
-            if found_keywords:
-                # Сохраняем найденное сообщение для пользователя
-                conn = get_db_connection()
-                cursor = conn.cursor()
-                cursor.execute(
-                    "INSERT INTO found_messages (user_id, chat_name, username, message_text, keywords_found, source_type) VALUES (?, ?, ?, ?, ?, ?)",
-                    (
-                        check_user_id,
-                        message.chat.title or f"ЛС: {message.from_user.full_name}",
-                        message.from_user.username or "Нет username",
-                        message.text,
-                        ', '.join(found_keywords),
-                        message.chat.type
-                    )
-                )
-                conn.commit()
-                conn.close()
-                
-                # Отправляем уведомление пользователю
-                alert = (
-                    f"🚨 <b>Найдено ключевое слово!</b>\n\n"
-                    f"📁 <b>Чат:</b> {message.chat.title or 'ЛС'}\n"
-                    f"👤 <b>Отправитель:</b> {message.from_user.full_name}\n"
-                    f"🔍 <b>Ваши ключи:</b> {', '.join(found_keywords)}\n"
-                    f"💬 <b>Текст:</b> {message.text[:80]}..."
-                )
-                
-                try:
-                    await bot.send_message(check_user_id, alert)
-                    logger.info(f"🔍 Уведомление отправлено пользователю {check_user_id}: {found_keywords}")
-                except Exception as e:
-                    logger.error(f"Ошибка отправки уведомления пользователю {check_user_id}: {e}")
-        
-        # Логируем общую активность
-        if users_to_check:
-            logger.info(f"📨 Сообщение в чате {message.chat.id} проверено для {len(users_to_check)} пользователей")
+        if alerts:
+            text = "🚨 <b>Последние сообщения с ключевыми словами:</b>\n\n"
+            for chat, user, msg, keywords, time in alerts:
+                time_str = datetime.strptime(time, '%Y-%m-%d %H:%M:%S').strftime('%H:%M')
+                text += f"📁 <b>Чат:</b> {chat}\n"
+                text += f"👤 <b>Юзер:</b> {user or 'N/A'}\n"
+                text += f"🔍 <b>Ключи:</b> {keywords}\n"
+                text += f"💬 <b>Текст:</b> {msg[:60]}...\n"
+                text += f"⏰ <b>Время:</b> {time_str}\n"
+                text += "━━━━━━━━━━━━━━━━━━\n"
+            await message.answer(text)
+        else:
+            await message.answer("📝 Сообщений с ключевыми словами не найдено")
             
     except Exception as e:
-        logger.error(f"❌ Ошибка многопользовательского мониторинга: {e}")
+        logger.error(f"Ошибка получения алертов: {e}")
+        await message.answer("❌ Ошибка получения алертов")
+
+@dp.message(Command("recent"))
+async def cmd_recent(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT chat_name, username, message_text, timestamp 
+            FROM all_messages 
+            ORDER BY timestamp DESC 
+            LIMIT 8
+        """)
+        recent = cursor.fetchall()
+        conn.close()
+        
+        if recent:
+            text = "📋 <b>Последние сообщения:</b>\n\n"
+            for chat, user, msg, time in recent:
+                time_str = datetime.strptime(time, '%Y-%m-%d %H:%M:%S').strftime('%H:%M')
+                has_keywords = any(kw in msg.lower() for kw in get_keywords())
+                alert_flag = "🚨 " if has_keywords else ""
+                text += f"{alert_flag}📁 <b>{chat}</b>\n"
+                text += f"👤 {user or 'N/A'} | ⏰ {time_str}\n"
+                text += f"💬 {msg[:50]}...\n"
+                text += "────────────────────\n"
+            await message.answer(text)
+        else:
+            await message.answer("📝 Сообщений не найдено")
+            
+    except Exception as e:
+        logger.error(f"Ошибка получения recent: {e}")
+        await message.answer("❌ Ошибка получения сообщений")
+
+@dp.message(Command("search"))
+async def cmd_search(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("❌ Используйте: /search <текст для поиска>")
+        return
+    
+    search_text = args[1].strip().lower()
+    
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT chat_name, username, message_text, timestamp 
+            FROM all_messages 
+            WHERE LOWER(message_text) LIKE ? 
+            ORDER BY timestamp DESC 
+            LIMIT 10
+        """, (f'%{search_text}%',))
+        results = cursor.fetchall()
+        conn.close()
+        
+        if results:
+            text = f"🔍 <b>Результаты поиска '{search_text}':</b>\n\n"
+            for chat, user, msg, time in results:
+                time_str = datetime.strptime(time, '%Y-%m-%d %H:%M:%S').strftime('%H:%M')
+                # Подсветка найденного текста
+                highlighted_msg = msg.replace(search_text, f"<b>{search_text}</b>")
+                text += f"📁 <b>{chat}</b>\n"
+                text += f"👤 {user or 'N/A'} | ⏰ {time_str}\n"
+                text += f"💬 {highlighted_msg[:80]}...\n"
+                text += "────────────────────\n"
+            await message.answer(text)
+        else:
+            await message.answer(f"📝 По запросу '{search_text}' ничего не найдено")
+            
+    except Exception as e:
+        logger.error(f"Ошибка поиска: {e}")
+        await message.answer("❌ Ошибка поиска")
+
+# Обработчик сообщений через aiogram (для ЛС бота)
+@dp.message(F.text)
+async def handle_private_messages(message: Message):
+    """Обработка сообщений в ЛС бота"""
+    user_id = message.from_user.id
+    
+    if user_id not in ADMIN_IDS:
+        await message.answer("❌ Доступ запрещен")
+        return
+    
+    # Сохраняем сообщения из ЛС с ботом
+    message_data = {
+        'message_id': message.message_id,
+        'chat_id': str(message.chat.id),
+        'chat_name': f"ЛС: {message.from_user.full_name}",
+        'user_id': str(message.from_user.id),
+        'username': message.from_user.username,
+        'message_text': message.text,
+        'has_keywords': False,
+        'keywords_found': '',
+        'message_type': 'private'
+    }
+    
+    has_keywords, found_keywords = await check_keywords(message.text)
+    if has_keywords:
+        message_data['has_keywords'] = True
+        message_data['keywords_found'] = ', '.join(found_keywords)
+    
+    save_message(message_data)
+
+# Telethon обработчик для мониторинга всех сообщений
+@telethon_client.on(events.NewMessage)
+async def handle_all_telegram_messages(event):
+    """Обработка ВСЕХ сообщений через Telethon"""
+    try:
+        # Пропускаем служебные сообщения
+        if not event.message.text or event.message.text.strip() == '':
+            return
+        
+        # Получаем информацию о чате
+        chat = await event.get_chat()
+        chat_id = str(chat.id)
+        chat_name = getattr(chat, 'title', f"{getattr(chat, 'first_name', 'Unknown')} {getattr(chat, 'last_name', '')}").strip()
+        
+        # Получаем информацию об отправителе
+        sender = await event.get_sender()
+        user_id = str(getattr(sender, 'id', 'Unknown'))
+        username = getattr(sender, 'username', 'Unknown')
+        
+        message_text = event.message.text
+        
+        # Проверяем ключевые слова
+        has_keywords, found_keywords = await check_keywords(message_text)
+        
+        # Сохраняем сообщение
+        message_data = {
+            'message_id': event.message.id,
+            'chat_id': chat_id,
+            'chat_name': chat_name,
+            'user_id': user_id,
+            'username': username,
+            'message_text': message_text,
+            'has_keywords': has_keywords,
+            'keywords_found': ', '.join(found_keywords) if found_keywords else '',
+            'message_type': 'channel' if hasattr(chat, 'broadcast') and chat.broadcast else 'group'
+        }
+        
+        save_message(message_data)
+        
+        # Логируем для отладки
+        if has_keywords:
+            logger.info(f"🚨 Найдены ключи в чате {chat_name}: {found_keywords}")
+        else:
+            logger.debug(f"📨 Сообщение из {chat_name}: {message_text[:50]}...")
+        
+        # Отправляем уведомление админам если есть ключевые слова
+        if has_keywords and found_keywords:
+            alert_text = (
+                f"🚨 <b>Обнаружены ключевые слова!</b>\n\n"
+                f"📁 <b>Чат:</b> {chat_name}\n"
+                f"👤 <b>Пользователь:</b> {username} (ID: {user_id})\n"
+                f"🔍 <b>Ключевые слова:</b> {', '.join(found_keywords)}\n"
+                f"💬 <b>Сообщение:</b> {message_text[:150]}..."
+            )
+            
+            for admin_id in ADMIN_IDS:
+                try:
+                    await bot.send_message(admin_id, alert_text)
+                except Exception as e:
+                    logger.error(f"Ошибка отправки уведомления админу {admin_id}: {e}")
+                    
+    except Exception as e:
+        logger.error(f"❌ Ошибка обработки сообщения Telethon: {e}")
+
+async def start_telethon_monitoring():
+    """Запуск мониторинга через Telethon"""
+    try:
+        await telethon_client.start()
+        logger.info("✅ Telethon мониторинг запущен - отслеживаются ВСЕ сообщения!")
+        
+        # Проверяем подключение
+        me = await telethon_client.get_me()
+        logger.info(f"✅ Подключено как: {me.first_name} (@{me.username})")
+        
+        # Запускаем прослушивание сообщений
+        await telethon_client.run_until_disconnected()
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка запуска Telethon: {e}")
 
 # HTTP сервер для проверки здоровья
 async def health_check(request):
-    return web.Response(text="Multi-user Monitoring Bot is running!")
+    return web.Response(text="Full Monitoring Bot is running!")
 
 async def start_http_server():
     """Запуск HTTP сервера для Railway"""
@@ -532,7 +551,7 @@ async def start_http_server():
 
 async def main():
     """Основная функция запуска"""
-    logger.info("🚀 Запуск многопользовательского бота мониторинга...")
+    logger.info("🚀 Запуск системы мониторинга всех сообщений...")
     
     # Инициализация БД
     init_db()
@@ -540,9 +559,12 @@ async def main():
     # Запуск HTTP сервера
     await start_http_server()
     
+    # Запуск Telethon мониторинга в фоне
+    asyncio.create_task(start_telethon_monitoring())
+    
     # Запуск бота
     await bot.delete_webhook(drop_pending_updates=True)
-    logger.info("✅ Многопользовательский бот запущен и готов к работе!")
+    logger.info("✅ Бот запущен и мониторит ВСЕ сообщения!")
     
     # Запускаем поллинг
     await dp.start_polling(bot)
