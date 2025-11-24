@@ -9,6 +9,7 @@ from aiogram.types import Message
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 import aiohttp
+from aiohttp import web
 
 # Конфигурация для Railway
 BOT_TOKEN = os.getenv('BOT_TOKEN')
@@ -28,10 +29,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Инициализация бота
+# Инициализация бота (ИСПРАВЛЕННАЯ СТРОКА)
 bot = Bot(
     token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTHTML)
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)  # ← ИСПРАВЛЕНО: HTML вместо HTHTML
 )
 dp = Dispatcher()
 
@@ -42,7 +43,9 @@ monitored_chats_cache = set()
 def init_db():
     """Инициализация базы данных"""
     try:
-        conn = sqlite3.connect('/data/monitoring.db' if os.path.exists('/data') else 'monitoring.db')
+        # Используем /data для постоянного хранения на Railway
+        db_path = '/data/monitoring.db' if os.path.exists('/data') else 'monitoring.db'
+        conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
         
         cursor.execute('''
@@ -116,6 +119,7 @@ def get_db_connection():
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     if message.from_user.id not in ADMIN_IDS:
+        await message.answer("❌ Доступ запрещен")
         return
     
     await message.answer(
@@ -152,6 +156,7 @@ async def cmd_add_keyword(message: Message):
         await message.answer(f"✅ Добавлено: <code>{keyword}</code>")
         
     except Exception as e:
+        logger.error(f"Ошибка добавления ключевого слова: {e}")
         await message.answer("❌ Ошибка добавления")
 
 @dp.message(Command("keywords"))
@@ -188,6 +193,7 @@ async def cmd_add_chat(message: Message):
         await message.answer(f"✅ Чат добавлен: <code>{chat_name}</code>")
         
     except Exception as e:
+        logger.error(f"Ошибка добавления чата: {e}")
         await message.answer("❌ Ошибка добавления чата")
 
 @dp.message(Command("stats"))
@@ -227,6 +233,7 @@ async def cmd_stats(message: Message):
         await message.answer(stats_text)
         
     except Exception as e:
+        logger.error(f"Ошибка получения статистики: {e}")
         await message.answer("❌ Ошибка статистики")
 
 @dp.message(Command("logs"))
@@ -237,19 +244,26 @@ async def cmd_logs(message: Message):
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT chat_name, keywords_found, message_text FROM found_messages ORDER BY timestamp DESC LIMIT 8")
+        cursor.execute("""
+            SELECT chat_name, keywords_found, message_text, timestamp 
+            FROM found_messages 
+            ORDER BY timestamp DESC 
+            LIMIT 8
+        """)
         logs = cursor.fetchall()
         conn.close()
         
         if logs:
             text = "📋 <b>Последние находки:</b>\n\n"
-            for chat, keywords, msg in logs:
-                text += f"📁 {chat}\n🔍 {keywords}\n💬 {msg[:40]}...\n━━━━━━━━━━━━━━\n"
+            for chat, keywords, msg, time in logs:
+                time_str = datetime.strptime(time, '%Y-%m-%d %H:%M:%S').strftime('%H:%M')
+                text += f"📁 {chat}\n🔍 {keywords}\n💬 {msg[:40]}...\n⏰ {time_str}\n━━━━━━━━━━━━━━\n"
             await message.answer(text)
         else:
             await message.answer("📝 Пока ничего не найдено")
             
     except Exception as e:
+        logger.error(f"Ошибка получения логов: {e}")
         await message.answer("❌ Ошибка логов")
 
 # Основной мониторинг
@@ -269,7 +283,7 @@ async def monitor_all_messages(message: Message):
                 "INSERT INTO found_messages (chat_name, username, message_text, keywords_found) VALUES (?, ?, ?, ?)",
                 (
                     message.chat.title or f"ЛС: {message.from_user.full_name}",
-                    message.from_user.username,
+                    message.from_user.username or "Нет username",
                     message.text,
                     ', '.join(found_keywords)
                 )
@@ -289,23 +303,22 @@ async def monitor_all_messages(message: Message):
             for admin_id in ADMIN_IDS:
                 try:
                     await bot.send_message(admin_id, alert)
-                except:
-                    pass  # Игнорируем ошибки отправки
+                except Exception as e:
+                    logger.error(f"Ошибка отправки админу {admin_id}: {e}")
             
-            logger.info(f"🔍 Найдены ключи: {found_keywords}")
+            logger.info(f"🔍 Найдены ключи: {found_keywords} в чате {message.chat.id}")
             
     except Exception as e:
         logger.error(f"❌ Ошибка мониторинга: {e}")
 
-# HTTP сервер для проверки здоровья (требуется Railway)
-from aiohttp import web
-
+# HTTP сервер для проверки здоровья
 async def health_check(request):
     return web.Response(text="Bot is running!")
 
 async def start_http_server():
     """Запуск HTTP сервера для Railway"""
     app = web.Application()
+    app.router.add_get('/', health_check)
     app.router.add_get('/health', health_check)
     runner = web.AppRunner(app)
     await runner.setup()
@@ -325,6 +338,9 @@ async def main():
     
     # Запуск бота
     await bot.delete_webhook(drop_pending_updates=True)
+    logger.info("✅ Бот запущен и готов к мониторингу!")
+    
+    # Запускаем поллинг
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
