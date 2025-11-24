@@ -519,7 +519,7 @@ async def cmd_add_session(message: Message):
     help_text = (
         "🔐 Добавление сессии для мониторинга\n\n"
         "Для создания сессии используйте нашего бота:\n"
-        "@SessionGeneratorBot\n\n"
+        "@testses_ses_bot\n\n"
         "После получения строки сессии отправьте команду:\n\n"
         "/session_data название_сессии ваша_строка_сессии\n\n"
         "Пример:\n"
