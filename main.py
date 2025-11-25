@@ -111,6 +111,24 @@ def init_db():
             )
         ''')
         
+        # Сообщения пользователей
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                session_id INTEGER,
+                chat_id TEXT,
+                chat_name TEXT,
+                username TEXT,
+                message_text TEXT,
+                has_keywords BOOLEAN DEFAULT 0,
+                keywords_found TEXT,
+                message_type TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (user_id)
+            )
+        ''')
+        
         # Добавляем админов в белый список
         for admin_id in ADMIN_IDS:
             cursor.execute("INSERT OR IGNORE INTO users (user_id, username, first_name) VALUES (?, ?, ?)", 
@@ -142,6 +160,43 @@ def is_user_allowed(user_id: int):
     except Exception as e:
         logger.error(f"❌ Ошибка проверки доступа для {user_id}: {e}")
         return False
+
+def add_user_to_whitelist(user_id: int, username: str, added_by: int):
+    """Добавление пользователя в белый список"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        # Добавляем в основную таблицу пользователей
+        cursor.execute("INSERT OR IGNORE INTO users (user_id, username, first_name) VALUES (?, ?, ?)", 
+                      (user_id, username, f"User_{user_id}"))
+        # Добавляем в белый список
+        cursor.execute("INSERT OR IGNORE INTO allowed_users (user_id, username, added_by) VALUES (?, ?, ?)", 
+                      (user_id, username, added_by))
+        conn.commit()
+        conn.close()
+        logger.info(f"✅ Пользователь {user_id} добавлен в белый список")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Ошибка добавления в белый список {user_id}: {e}")
+        return False
+
+def get_allowed_users():
+    """Получение списка всех пользователей с доступом"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT au.user_id, au.username, u.first_name, au.added_at 
+            FROM allowed_users au 
+            LEFT JOIN users u ON au.user_id = u.user_id
+            ORDER BY au.added_at DESC
+        """)
+        users = cursor.fetchall()
+        conn.close()
+        return users
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения списка пользователей: {e}")
+        return []
 
 def get_user_sessions(user_id: int):
     """Получение сессий пользователя"""
@@ -226,6 +281,7 @@ def save_user_message(user_id: int, message_data: dict):
         ))
         conn.commit()
         conn.close()
+        logger.info(f"💬 Сообщение сохранено для {user_id}")
     except Exception as e:
         logger.error(f"❌ Ошибка сохранения сообщения для {user_id}: {e}")
 
@@ -429,10 +485,67 @@ async def cmd_start(message: Message):
         "📊 /my_stats - моя статистика\n"
         "🚨 /my_alerts - мои уведомления\n"
         "👥 /add_user - добавить пользователя (админ)\n"
-        "📋 /users - список пользователей (админ)"
+        "📋 /users - список пользователей (админ)\n"
+        "📡 /status - статус мониторинга"
     )
     
     await message.answer(welcome_text)
+
+@dp.message(Command("add_user"))
+async def cmd_add_user(message: Message):
+    user_id = message.from_user.id
+    
+    # Проверяем права администратора
+    if user_id not in ADMIN_IDS:
+        await message.answer("❌ Недостаточно прав")
+        return
+    
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("❌ Используйте: /add_user user_id")
+        return
+    
+    try:
+        target_user_id = int(args[1])
+        username = message.from_user.username or f"user_{target_user_id}"
+        
+        if add_user_to_whitelist(target_user_id, username, user_id):
+            await message.answer(f"✅ Пользователь {target_user_id} добавлен в белый список")
+        else:
+            await message.answer("❌ Ошибка добавления пользователя")
+    except ValueError:
+        await message.answer("❌ Неверный user_id. Используйте числовой ID.")
+
+@dp.message(Command("users"))
+async def cmd_users(message: Message):
+    user_id = message.from_user.id
+    
+    if user_id not in ADMIN_IDS:
+        await message.answer("❌ Недостаточно прав")
+        return
+    
+    try:
+        users = get_allowed_users()
+        
+        if users:
+            text = "👥 Пользователи с доступом:\n\n"
+            for user_id, username, first_name, added_at in users:
+                # Проверяем активные сессии
+                active_sessions = sum(1 for key in active_clients.keys() if key.startswith(f"{user_id}_"))
+                status = "🟢" if active_sessions > 0 else "⚪"
+                
+                text += f"{status} ID: {user_id}\n"
+                text += f"   👤 {username or 'No username'}\n"
+                text += f"   📊 Активных сессий: {active_sessions}\n"
+                text += f"   📅 Добавлен: {added_at[:10]}\n"
+                text += "   ──────────\n"
+            
+            await message.answer(text)
+        else:
+            await message.answer("📝 Пользователи не найдены")
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения пользователей: {e}")
+        await message.answer("❌ Ошибка получения списка")
 
 @dp.message(Command("add_session"))
 async def cmd_add_session(message: Message):
@@ -703,6 +816,44 @@ async def cmd_my_stats(message: Message):
     except Exception as e:
         await message.answer("❌ Ошибка получения статистики")
 
+@dp.message(Command("my_alerts"))
+async def cmd_my_alerts(message: Message):
+    user_id = message.from_user.id
+    
+    if not is_user_allowed(user_id):
+        return
+    
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT chat_name, username, message_text, keywords_found, timestamp 
+            FROM user_messages 
+            WHERE user_id = ? AND has_keywords = 1
+            ORDER BY timestamp DESC 
+            LIMIT 10
+        """, (user_id,))
+        alerts = cursor.fetchall()
+        conn.close()
+        
+        if alerts:
+            text = "🚨 Последние уведомления:\n\n"
+            for chat, user, msg, keywords, time in alerts:
+                time_str = datetime.strptime(time, '%Y-%m-%d %H:%M:%S').strftime('%H:%M')
+                clean_msg = re.sub(r'\*{2,}', '', msg)
+                text += f"📱 Чат: {chat}\n"
+                text += f"👤 Юзер: {user or 'N/A'}\n"
+                text += f"🔍 Ключи: {keywords}\n"
+                text += f"💬 Текст: {clean_msg[:60]}...\n"
+                text += f"⏰ Время: {time_str}\n"
+                text += "──────\n"
+            await message.answer(text)
+        else:
+            await message.answer("📝 У вас пока нет уведомлений")
+            
+    except Exception as e:
+        await message.answer("❌ Ошибка получения уведомлений")
+
 @dp.message(Command("status"))
 async def cmd_status(message: Message):
     """Проверка статуса мониторинга"""
@@ -715,7 +866,12 @@ async def cmd_status(message: Message):
     for key in active_clients.keys():
         if key.startswith(f"{user_id}_"):
             session_id = key.split('_')[1]
-            active_sessions.append(session_id)
+            # Находим название сессии по ID
+            sessions = get_user_sessions(user_id)
+            for sess_id, sess_name, _, _ in sessions:
+                if str(sess_id) == session_id:
+                    active_sessions.append(sess_name)
+                    break
     
     if active_sessions:
         await message.answer(f"✅ Мониторинг активен\n🟢 Сессии: {', '.join(active_sessions)}")
