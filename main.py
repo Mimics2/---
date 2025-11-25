@@ -41,6 +41,49 @@ dp = Dispatcher()
 # Словарь для хранения активных клиентов Telethon
 active_clients = {}
 
+# Словарь для управления флуд-контролем
+user_last_message = {}
+message_queue = asyncio.Queue()
+processing = False
+
+async def message_worker():
+    """Воркер для обработки сообщений с задержками"""
+    global processing
+    processing = True
+    while processing:
+        try:
+            user_id, text, reply_markup = await message_queue.get()
+            
+            # Проверяем время последнего сообщения пользователю
+            current_time = datetime.now().timestamp()
+            last_time = user_last_message.get(user_id, 0)
+            
+            if current_time - last_time < 1:  # Минимальная задержка 1 секунда
+                await asyncio.sleep(1)
+            
+            try:
+                await bot.send_message(user_id, text, reply_markup=reply_markup, parse_mode=None)
+                user_last_message[user_id] = datetime.now().timestamp()
+                logger.info(f"📤 Сообщение отправлено пользователю {user_id}")
+            except Exception as e:
+                logger.error(f"❌ Ошибка отправки сообщения {user_id}: {e}")
+            
+            await asyncio.sleep(0.1)  # Базовая задержка между сообщениями
+            message_queue.task_done()
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка в message_worker: {e}")
+            await asyncio.sleep(1)
+
+async def safe_send_message(user_id: int, text: str, reply_markup=None):
+    """Безопасная отправка сообщения с очередью"""
+    try:
+        # Очищаем текст от HTML тегов для обычного режима
+        clean_text = re.sub(r'<[^>]+>', '', text)
+        await message_queue.put((user_id, clean_text, reply_markup))
+    except Exception as e:
+        logger.error(f"❌ Ошибка добавления в очередь: {e}")
+
 def init_db():
     """Инициализация базы данных"""
     try:
@@ -449,7 +492,7 @@ async def start_user_session(user_id: int, session_id: int, session_name: str, s
         # Тестируем сессию перед запуском
         is_valid, message = await test_session(session_string)
         if not is_valid:
-            await bot.send_message(user_id, f"❌ Не удалось запустить сессию '{session_name}': {message}")
+            await safe_send_message(user_id, f"❌ Не удалось запустить сессию '{session_name}': {message}")
             return False
 
         # Создаем клиента Telethon
@@ -511,7 +554,7 @@ async def start_user_session(user_id: int, session_id: int, session_name: str, s
                     )
                     
                     try:
-                        await bot.send_message(user_id, alert_text)
+                        await safe_send_message(user_id, alert_text)
                         logger.info(f"🔔 Уведомление отправлено {user_id}: {found_keywords}")
                     except Exception as e:
                         logger.error(f"❌ Ошибка отправки: {e}")
@@ -529,25 +572,25 @@ async def start_user_session(user_id: int, session_id: int, session_name: str, s
         
         logger.info(f"✅ Сессия запущена для {user_id}: {session_name} (@{me.username})")
         
-        # Запускаем прослушивание в фоне - БЕЗ ЗАДЕРЖЕК!
+        # Запускаем прослушивание в фоне
         asyncio.create_task(client.run_until_disconnected())
         
-        await bot.send_message(user_id, f"✅ Мониторинг запущен для сессии '{session_name}' (@{me.username})")
+        await safe_send_message(user_id, f"✅ Мониторинг запущен для сессии '{session_name}' (@{me.username})")
         return True
         
     except SessionPasswordNeededError:
         error_msg = "❌ Сессия требует двухфакторную аутентификацию"
-        await bot.send_message(user_id, error_msg)
+        await safe_send_message(user_id, error_msg)
         logger.error(f"❌ 2FA required for {session_name}")
         return False
     except PhoneNumberInvalidError:
         error_msg = "❌ Неверный номер телефона в сессии"
-        await bot.send_message(user_id, error_msg)
+        await safe_send_message(user_id, error_msg)
         logger.error(f"❌ Invalid phone for {session_name}")
         return False
     except Exception as e:
         error_msg = f"❌ Ошибка запуска сессии: {str(e)}"
-        await bot.send_message(user_id, error_msg)
+        await safe_send_message(user_id, error_msg)
         logger.error(f"❌ Ошибка запуска {session_name}: {e}")
         return False
 
@@ -588,7 +631,7 @@ async def check_access_middleware(handler, event: Message, data):
     # Проверяем доступ для команд кроме start
     if event.text and not event.text.startswith('/start'):
         if not is_user_allowed(user_id):
-            await event.answer("❌ Доступ запрещен. Обратитесь к администратору.")
+            await safe_send_message(user_id, "❌ Доступ запрещен. Обратитесь к администратору.")
             return
     
     return await handler(event, data)
@@ -620,7 +663,7 @@ async def cmd_start(message: Message):
         "📡 /status - статус мониторинга"
     )
     
-    await message.answer(welcome_text)
+    await safe_send_message(user_id, welcome_text)
 
 @dp.message(Command("add_session"))
 async def cmd_add_session(message: Message):
@@ -639,7 +682,7 @@ async def cmd_add_session(message: Message):
             "Пример:\n"
             "/add_session моя_сессия 1ApWapzMBu4qU7..."
         )
-        await message.answer(help_text)
+        await safe_send_message(user_id, help_text)
         return
     
     session_name = args[1]
@@ -649,14 +692,14 @@ async def cmd_add_session(message: Message):
     is_valid, validation_msg = await test_session(session_string)
     
     if not is_valid:
-        await message.answer(f"❌ Невалидная сессия: {validation_msg}")
+        await safe_send_message(user_id, f"❌ Невалидная сессия: {validation_msg}")
         return
     
     # Сохраняем сессию
     if save_user_session(user_id, session_name, session_string):
-        await message.answer(f"✅ Сессия '{session_name}' успешно сохранена!\n\nТеперь вы можете запустить мониторинг: /start_session")
+        await safe_send_message(user_id, f"✅ Сессия '{session_name}' успешно сохранена!\n\nТеперь вы можете запустить мониторинг: /start_session")
     else:
-        await message.answer("❌ Ошибка сохранения сессии")
+        await safe_send_message(user_id, "❌ Ошибка сохранения сессии")
 
 @dp.message(Command("keywords"))
 async def cmd_keywords(message: Message):
@@ -671,14 +714,14 @@ async def cmd_keywords(message: Message):
     if keywords:
         text = f"🔍 Ваши ключевые слова ({len(keywords)}):\n\n"
         for keyword_id, keyword in keywords:
-            text += f"🆔 {keyword_id} • {keyword}\n"
+            text += f"ID {keyword_id} • {keyword}\n"
         
         text += "\n🗑️ Удалить: /del_keyword <ID>"
         text += "\n🧹 Очистить все: /clear_keywords"
     else:
         text = "📝 У вас пока нет ключевых слов\n\nДобавьте: /add_keyword слово1,слово2"
     
-    await message.answer(text)
+    await safe_send_message(user_id, text)
 
 @dp.message(Command("exceptions"))
 async def cmd_exceptions(message: Message):
@@ -693,14 +736,14 @@ async def cmd_exceptions(message: Message):
     if exceptions:
         text = f"🚫 Ваши исключения ({len(exceptions)}):\n\n"
         for exception_id, exception in exceptions:
-            text += f"🆔 {exception_id} • {exception}\n"
+            text += f"ID {exception_id} • {exception}\n"
         
         text += "\n🗑️ Удалить: /del_exception <ID>"
         text += "\n🧹 Очистить все: /clear_exceptions"
     else:
         text = "📝 У вас пока нет исключений\n\nДобавьте: /add_exception слово1,слово2"
     
-    await message.answer(text)
+    await safe_send_message(user_id, text)
 
 @dp.message(Command("del_keyword"))
 async def cmd_del_keyword(message: Message):
@@ -712,17 +755,17 @@ async def cmd_del_keyword(message: Message):
     
     args = message.text.split()
     if len(args) < 2:
-        await message.answer("❌ Используйте: /del_keyword <ID>\n\nПосмотреть ID: /keywords")
+        await safe_send_message(user_id, "❌ Используйте: /del_keyword <ID>\n\nПосмотреть ID: /keywords")
         return
     
     try:
         keyword_id = int(args[1])
         if delete_user_keyword(user_id, keyword_id):
-            await message.answer(f"✅ Ключевое слово ID {keyword_id} удалено")
+            await safe_send_message(user_id, f"✅ Ключевое слово ID {keyword_id} удалено")
         else:
-            await message.answer("❌ Не удалось удалить ключевое слово. Проверьте ID")
+            await safe_send_message(user_id, "❌ Не удалось удалить ключевое слово. Проверьте ID")
     except ValueError:
-        await message.answer("❌ Неверный ID. Используйте числовой ID")
+        await safe_send_message(user_id, "❌ Неверный ID. Используйте числовой ID")
 
 @dp.message(Command("del_exception"))
 async def cmd_del_exception(message: Message):
@@ -734,17 +777,17 @@ async def cmd_del_exception(message: Message):
     
     args = message.text.split()
     if len(args) < 2:
-        await message.answer("❌ Используйте: /del_exception <ID>\n\nПосмотреть ID: /exceptions")
+        await safe_send_message(user_id, "❌ Используйте: /del_exception <ID>\n\nПосмотреть ID: /exceptions")
         return
     
     try:
         exception_id = int(args[1])
         if delete_user_exception(user_id, exception_id):
-            await message.answer(f"✅ Исключение ID {exception_id} удалено")
+            await safe_send_message(user_id, f"✅ Исключение ID {exception_id} удалено")
         else:
-            await message.answer("❌ Не удалось удалить исключение. Проверьте ID")
+            await safe_send_message(user_id, "❌ Не удалось удалить исключение. Проверьте ID")
     except ValueError:
-        await message.answer("❌ Неверный ID. Используйте числовой ID")
+        await safe_send_message(user_id, "❌ Неверный ID. Используйте числовой ID")
 
 @dp.message(Command("clear_keywords"))
 async def cmd_clear_keywords(message: Message):
@@ -755,9 +798,9 @@ async def cmd_clear_keywords(message: Message):
         return
     
     if clear_all_keywords(user_id):
-        await message.answer("✅ Все ключевые слова очищены")
+        await safe_send_message(user_id, "✅ Все ключевые слова очищены")
     else:
-        await message.answer("❌ Ошибка при очистке ключевых слов")
+        await safe_send_message(user_id, "❌ Ошибка при очистке ключевых слов")
 
 @dp.message(Command("clear_exceptions"))
 async def cmd_clear_exceptions(message: Message):
@@ -768,9 +811,9 @@ async def cmd_clear_exceptions(message: Message):
         return
     
     if clear_all_exceptions(user_id):
-        await message.answer("✅ Все исключения очищены")
+        await safe_send_message(user_id, "✅ Все исключения очищены")
     else:
-        await message.answer("❌ Ошибка при очистке исключений")
+        await safe_send_message(user_id, "❌ Ошибка при очистке исключений")
 
 @dp.message(Command("add_keyword"))
 async def cmd_add_keyword(message: Message):
@@ -782,16 +825,16 @@ async def cmd_add_keyword(message: Message):
     
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        await message.answer("❌ Используйте: /add_keyword слово1,слово2,слово3")
+        await safe_send_message(user_id, "❌ Используйте: /add_keyword слово1,слово2,слово3")
         return
     
     keywords_text = args[1]
     added_count, keywords = add_user_keywords(user_id, keywords_text)
     
     if added_count > 0:
-        await message.answer(f"✅ Добавлено {added_count} ключевых слов: {', '.join(keywords)}")
+        await safe_send_message(user_id, f"✅ Добавлено {added_count} ключевых слов: {', '.join(keywords)}")
     else:
-        await message.answer("❌ Не удалось добавить ключевые слова")
+        await safe_send_message(user_id, "❌ Не удалось добавить ключевые слова")
 
 @dp.message(Command("add_exception"))
 async def cmd_add_exception(message: Message):
@@ -803,16 +846,16 @@ async def cmd_add_exception(message: Message):
     
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        await message.answer("❌ Используйте: /add_exception слово1,слово2,слово3")
+        await safe_send_message(user_id, "❌ Используйте: /add_exception слово1,слово2,слово3")
         return
     
     exceptions_text = args[1]
     added_count, exceptions = add_user_exceptions(user_id, exceptions_text)
     
     if added_count > 0:
-        await message.answer(f"✅ Добавлено {added_count} исключений: {', '.join(exceptions)}")
+        await safe_send_message(user_id, f"✅ Добавлено {added_count} исключений: {', '.join(exceptions)}")
     else:
-        await message.answer("❌ Не удалось добавить исключения")
+        await safe_send_message(user_id, "❌ Не удалось добавить исключения")
 
 @dp.message(Command("my_sessions"))
 async def cmd_my_sessions(message: Message):
@@ -825,18 +868,18 @@ async def cmd_my_sessions(message: Message):
     sessions = get_user_sessions(user_id)
     
     if not sessions:
-        await message.answer("📭 У вас нет сохраненных сессий\n\nДобавьте сессию: /add_session")
+        await safe_send_message(user_id, "📭 У вас нет сохраненных сессий\n\nДобавьте сессию: /add_session")
         return
     
     text = "📁 Ваши сессии:\n\n"
     for session_id, session_name, session_string, is_active in sessions:
         status = "🟢 Активна" if is_active else "🔴 Неактивна"
-        text += f"🆔 {session_id} • {session_name} • {status}\n"
+        text += f"ID {session_id} • {session_name} • {status}\n"
     
     text += "\n▶️ Запустить: /start_session <ID>"
     text += "\n⏹️ Остановить: /stop_session <ID>"
     
-    await message.answer(text)
+    await safe_send_message(user_id, text)
 
 @dp.message(Command("start_session"))
 async def cmd_start_session(message: Message):
@@ -848,7 +891,7 @@ async def cmd_start_session(message: Message):
     
     args = message.text.split()
     if len(args) < 2:
-        await message.answer("❌ Используйте: /start_session <ID_сессии>\n\nПосмотреть ID: /my_sessions")
+        await safe_send_message(user_id, "❌ Используйте: /start_session <ID_сессии>\n\nПосмотреть ID: /my_sessions")
         return
     
     try:
@@ -862,7 +905,7 @@ async def cmd_start_session(message: Message):
                 break
         
         if not target_session:
-            await message.answer("❌ Сессия с таким ID не найдена")
+            await safe_send_message(user_id, "❌ Сессия с таким ID не найдена")
             return
         
         session_id, session_name, session_string, is_active = target_session
@@ -871,12 +914,12 @@ async def cmd_start_session(message: Message):
         success = await start_user_session(user_id, session_id, session_name, session_string)
         
         if success:
-            await message.answer(f"✅ Сессия '{session_name}' запущена!")
+            await safe_send_message(user_id, f"✅ Сессия '{session_name}' запущена!")
         else:
-            await message.answer(f"❌ Не удалось запустить сессию '{session_name}'")
+            await safe_send_message(user_id, f"❌ Не удалось запустить сессию '{session_name}'")
             
     except ValueError:
-        await message.answer("❌ Неверный ID. Используйте числовой ID")
+        await safe_send_message(user_id, "❌ Неверный ID. Используйте числовой ID")
 
 @dp.message(Command("stop_session"))
 async def cmd_stop_session(message: Message):
@@ -888,7 +931,7 @@ async def cmd_stop_session(message: Message):
     
     args = message.text.split()
     if len(args) < 2:
-        await message.answer("❌ Используйте: /stop_session <ID_сессии>\n\nПосмотреть ID: /my_sessions")
+        await safe_send_message(user_id, "❌ Используйте: /stop_session <ID_сессии>\n\nПосмотреть ID: /my_sessions")
         return
     
     try:
@@ -896,12 +939,12 @@ async def cmd_stop_session(message: Message):
         success = await stop_user_session(user_id, session_id)
         
         if success:
-            await message.answer(f"✅ Сессия ID {session_id} остановлена")
+            await safe_send_message(user_id, f"✅ Сессия ID {session_id} остановлена")
         else:
-            await message.answer("❌ Не удалось остановить сессию. Возможно, она не запущена")
+            await safe_send_message(user_id, "❌ Не удалось остановить сессию. Возможно, она не запущена")
             
     except ValueError:
-        await message.answer("❌ Неверный ID. Используйте числовой ID")
+        await safe_send_message(user_id, "❌ Неверный ID. Используйте числовой ID")
 
 @dp.message(Command("add_user"))
 async def cmd_add_user(message: Message):
@@ -909,12 +952,12 @@ async def cmd_add_user(message: Message):
     user_id = message.from_user.id
     
     if user_id not in ADMIN_IDS:
-        await message.answer("❌ Недостаточно прав")
+        await safe_send_message(user_id, "❌ Недостаточно прав")
         return
     
     args = message.text.split()
     if len(args) < 2:
-        await message.answer("❌ Используйте: /add_user <user_id>")
+        await safe_send_message(user_id, "❌ Используйте: /add_user <user_id>")
         return
     
     try:
@@ -922,11 +965,11 @@ async def cmd_add_user(message: Message):
         username = message.from_user.username or f"user_{new_user_id}"
         
         if add_user_to_whitelist(new_user_id, username, user_id):
-            await message.answer(f"✅ Пользователь {new_user_id} добавлен в белый список")
+            await safe_send_message(user_id, f"✅ Пользователь {new_user_id} добавлен в белый список")
         else:
-            await message.answer("❌ Ошибка добавления пользователя")
+            await safe_send_message(user_id, "❌ Ошибка добавления пользователя")
     except ValueError:
-        await message.answer("❌ Неверный user_id")
+        await safe_send_message(user_id, "❌ Неверный user_id")
 
 @dp.message(Command("users"))
 async def cmd_users(message: Message):
@@ -934,21 +977,21 @@ async def cmd_users(message: Message):
     user_id = message.from_user.id
     
     if user_id not in ADMIN_IDS:
-        await message.answer("❌ Недостаточно прав")
+        await safe_send_message(user_id, "❌ Недостаточно прав")
         return
     
     users = get_allowed_users()
     
     if not users:
-        await message.answer("📝 Нет пользователей с доступом")
+        await safe_send_message(user_id, "📝 Нет пользователей с доступом")
         return
     
     text = "👥 Пользователи с доступом:\n\n"
     for user_id, username, first_name, added_at in users:
-        text += f"🆔 {user_id} • @{username} • {first_name}\n"
+        text += f"ID {user_id} • @{username} • {first_name}\n"
         text += f"   📅 Добавлен: {added_at}\n\n"
     
-    await message.answer(text)
+    await safe_send_message(user_id, text)
 
 @dp.message(Command("my_stats"))
 async def cmd_my_stats(message: Message):
@@ -989,11 +1032,11 @@ async def cmd_my_stats(message: Message):
             f"🟢 Активных сессий: {active_sessions}"
         )
         
-        await message.answer(text)
+        await safe_send_message(user_id, text)
         
     except Exception as e:
         logger.error(f"❌ Ошибка получения статистики: {e}")
-        await message.answer("❌ Ошибка получения статистики")
+        await safe_send_message(user_id, "❌ Ошибка получения статистики")
 
 @dp.message(Command("my_alerts"))
 async def cmd_my_alerts(message: Message):
@@ -1018,7 +1061,7 @@ async def cmd_my_alerts(message: Message):
         conn.close()
         
         if not alerts:
-            await message.answer("📭 У вас пока нет уведомлений")
+            await safe_send_message(user_id, "📭 У вас пока нет уведомлений")
             return
         
         text = "🚨 Последние уведомления:\n\n"
@@ -1030,11 +1073,11 @@ async def cmd_my_alerts(message: Message):
             text += f"   💬 {clean_message[:50]}...\n"
             text += f"   🕒 {timestamp}\n\n"
         
-        await message.answer(text[:4000])  # Ограничение длины
+        await safe_send_message(user_id, text[:4000])  # Ограничение длины
         
     except Exception as e:
         logger.error(f"❌ Ошибка получения уведомлений: {e}")
-        await message.answer("❌ Ошибка получения уведомлений")
+        await safe_send_message(user_id, "❌ Ошибка получения уведомлений")
 
 @dp.message(Command("status"))
 async def cmd_status(message: Message):
@@ -1054,7 +1097,7 @@ async def cmd_status(message: Message):
         f"👤 Ваш ID: {user_id}"
     )
     
-    await message.answer(text)
+    await safe_send_message(user_id, text)
 
 # Запуск всех сессий при старте бота
 async def start_all_sessions():
@@ -1074,7 +1117,7 @@ async def start_all_sessions():
                 is_valid, _ = await test_session(session_string)
                 if is_valid:
                     await start_user_session(user_id, session_id, session_name, session_string)
-                    # Убрана задержка между запусками для мгновенного старта
+                    await asyncio.sleep(2)  # Задержка между запусками сессий
                 else:
                     logger.error(f"❌ Невалидная сессия {session_name} для {user_id}")
         
@@ -1109,10 +1152,14 @@ async def main():
     # Запуск HTTP сервера
     await start_http_server()
     
+    # Запуск воркера для сообщений
+    asyncio.create_task(message_worker())
+    
     # Запуск бота
     await bot.delete_webhook(drop_pending_updates=True)
     
-    # Запуск всех сессий пользователей - БЕЗ ЗАДЕРЖЕК!
+    # Запуск всех сессий пользователей с задержкой
+    await asyncio.sleep(5)  # Даем боту время запуститься
     asyncio.create_task(start_all_sessions())
     
     logger.info("✅ Бот запущен!")
