@@ -166,10 +166,8 @@ def add_user_to_whitelist(user_id: int, username: str, added_by: int):
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        # Добавляем в основную таблицу пользователей
         cursor.execute("INSERT OR IGNORE INTO users (user_id, username, first_name) VALUES (?, ?, ?)", 
                       (user_id, username, f"User_{user_id}"))
-        # Добавляем в белый список
         cursor.execute("INSERT OR IGNORE INTO allowed_users (user_id, username, added_by) VALUES (?, ?, ?)", 
                       (user_id, username, added_by))
         conn.commit()
@@ -230,6 +228,66 @@ def save_user_session(user_id: int, session_name: str, session_string: str):
     except Exception as e:
         logger.error(f"❌ Ошибка сохранения сессии для {user_id}: {e}")
         return False
+
+def add_user_keywords(user_id: int, keywords_text: str):
+    """Добавление ключевых слов через запятую"""
+    try:
+        # Разделяем текст по запятым и очищаем от пробелов
+        keywords = [kw.strip() for kw in keywords_text.split(',') if kw.strip()]
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        added_count = 0
+        for keyword in keywords:
+            try:
+                cursor.execute(
+                    "INSERT OR IGNORE INTO user_keywords (user_id, keyword) VALUES (?, ?)",
+                    (user_id, keyword)
+                )
+                added_count += 1
+            except:
+                continue
+        
+        conn.commit()
+        conn.close()
+        
+        logger.info(f"🔍 Пользователь {user_id} добавил {added_count} ключевых слов")
+        return added_count, keywords
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка добавления ключевых слов для {user_id}: {e}")
+        return 0, []
+
+def add_user_exceptions(user_id: int, exceptions_text: str):
+    """Добавление исключений через запятую"""
+    try:
+        # Разделяем текст по запятым и очищаем от пробелов
+        exceptions = [exc.strip() for exc in exceptions_text.split(',') if exc.strip()]
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        added_count = 0
+        for exception in exceptions:
+            try:
+                cursor.execute(
+                    "INSERT OR IGNORE INTO user_exceptions (user_id, exception_word) VALUES (?, ?)",
+                    (user_id, exception)
+                )
+                added_count += 1
+            except:
+                continue
+        
+        conn.commit()
+        conn.close()
+        
+        logger.info(f"🚫 Пользователь {user_id} добавил {added_count} исключений")
+        return added_count, exceptions
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка добавления исключений для {user_id}: {e}")
+        return 0, []
 
 def get_user_keywords(user_id: int):
     """Получение ключевых слов пользователя"""
@@ -376,10 +434,13 @@ async def start_user_session(user_id: int, session_id: int, session_name: str, s
                 if has_keywords and found_keywords:
                     clean_message = re.sub(r'\*{2,}', '', message_text)
                     
+                    # Форматируем username с @ для удобного перехода
+                    username_display = f"@{username}" if username and username != "Unknown" else "Неизвестный"
+                    
                     alert_text = (
                         f"🚨 Найдено ключевое слово!\n\n"
                         f"📱 Чат: {chat_name}\n"
-                        f"👤 Отправитель: {username}\n"
+                        f"👤 Отправитель: {username_display}\n"
                         f"🔍 Ключи: {', '.join(found_keywords)}\n"
                         f"💬 Сообщение: {clean_message[:150]}...\n"
                         f"🔐 Сессия: {session_name}"
@@ -404,7 +465,7 @@ async def start_user_session(user_id: int, session_id: int, session_name: str, s
         
         logger.info(f"✅ Сессия запущена для {user_id}: {session_name} (@{me.username})")
         
-        # Запускаем прослушивание в фоне
+        # Запускаем прослушивание в фоне - БЕЗ ЗАДЕРЖЕК!
         asyncio.create_task(client.run_until_disconnected())
         
         await bot.send_message(user_id, f"✅ Мониторинг запущен для сессии '{session_name}' (@{me.username})")
@@ -480,8 +541,8 @@ async def cmd_start(message: Message):
         "📁 /my_sessions - мои сессии\n"
         "▶️ /start_session - запустить мониторинг\n"
         "⏹️ /stop_session - остановить мониторинг\n"
-        "🔍 /add_keyword - добавить ключевое слово\n"
-        "🚫 /add_exception - добавить исключение\n"
+        "🔍 /add_keyword - добавить ключевые слова\n"
+        "🚫 /add_exception - добавить исключения\n"
         "📊 /my_stats - моя статистика\n"
         "🚨 /my_alerts - мои уведомления\n"
         "👥 /add_user - добавить пользователя (админ)\n"
@@ -534,8 +595,11 @@ async def cmd_users(message: Message):
                 active_sessions = sum(1 for key in active_clients.keys() if key.startswith(f"{user_id}_"))
                 status = "🟢" if active_sessions > 0 else "⚪"
                 
+                # Форматируем username с @
+                username_display = f"@{username}" if username and username != "None" else "Нет username"
+                
                 text += f"{status} ID: {user_id}\n"
-                text += f"   👤 {username or 'No username'}\n"
+                text += f"   👤 {username_display}\n"
                 text += f"   📊 Активных сессий: {active_sessions}\n"
                 text += f"   📅 Добавлен: {added_at[:10]}\n"
                 text += "   ──────────\n"
@@ -708,25 +772,26 @@ async def cmd_add_keyword(message: Message):
     
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        await message.answer("❌ Используйте: /add_keyword слово")
+        await message.answer("❌ Используйте: /add_keyword слово1,слово2,слово3\n\nПример:\n/add_keyword тест,мимик,Москва,дом")
         return
     
-    keyword = args[1].strip()
+    keywords_text = args[1].strip()
     
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT OR IGNORE INTO user_keywords (user_id, keyword) VALUES (?, ?)",
-            (user_id, keyword)
+    if not keywords_text:
+        await message.answer("❌ Введите ключевые слова через запятую")
+        return
+    
+    added_count, keywords = add_user_keywords(user_id, keywords_text)
+    
+    if added_count > 0:
+        response_text = (
+            f"✅ Добавлено {added_count} ключевых слов:\n\n"
+            f"📝 Список:\n" + "\n".join(f"• {kw}" for kw in keywords) + "\n\n"
+            f"🔍 Всего ключевых слов: {len(get_user_keywords(user_id))}"
         )
-        conn.commit()
-        conn.close()
-        
-        await message.answer(f"✅ Ключевое слово добавлено: {keyword}")
-        
-    except Exception as e:
-        await message.answer("❌ Ошибка при добавлении")
+        await message.answer(response_text)
+    else:
+        await message.answer("❌ Не удалось добавить ключевые слова")
 
 @dp.message(Command("add_exception"))
 async def cmd_add_exception(message: Message):
@@ -737,25 +802,26 @@ async def cmd_add_exception(message: Message):
     
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        await message.answer("❌ Используйте: /add_exception слово")
+        await message.answer("❌ Используйте: /add_exception слово1,слово2,слово3\n\nПример:\n/add_exception спам,реклама,рассылка")
         return
     
-    exception_word = args[1].strip()
+    exceptions_text = args[1].strip()
     
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT OR IGNORE INTO user_exceptions (user_id, exception_word) VALUES (?, ?)",
-            (user_id, exception_word)
+    if not exceptions_text:
+        await message.answer("❌ Введите исключения через запятую")
+        return
+    
+    added_count, exceptions = add_user_exceptions(user_id, exceptions_text)
+    
+    if added_count > 0:
+        response_text = (
+            f"✅ Добавлено {added_count} исключений:\n\n"
+            f"📝 Список:\n" + "\n".join(f"• {exc}" for exc in exceptions) + "\n\n"
+            f"🚫 Всего исключений: {len(get_user_exceptions(user_id))}"
         )
-        conn.commit()
-        conn.close()
-        
-        await message.answer(f"✅ Исключение добавлено: {exception_word}")
-        
-    except Exception as e:
-        await message.answer("❌ Ошибка при добавлении")
+        await message.answer(response_text)
+    else:
+        await message.answer("❌ Не удалось добавить исключения")
 
 @dp.message(Command("my_keywords"))
 async def cmd_my_keywords(message: Message):
@@ -769,15 +835,15 @@ async def cmd_my_keywords(message: Message):
     
     text = ""
     if keywords:
-        text += "🔍 Ваши ключевые слова:\n" + "\n".join(f"• {kw}" for kw in sorted(keywords)) + "\n\n"
+        text += f"🔍 Ваши ключевые слова ({len(keywords)}):\n" + "\n".join(f"• {kw}" for kw in sorted(keywords)) + "\n\n"
     
     if exceptions:
-        text += "🚫 Ваши исключения:\n" + "\n".join(f"• {exc}" for exc in sorted(exceptions))
+        text += f"🚫 Ваши исключения ({len(exceptions)}):\n" + "\n".join(f"• {exc}" for exc in sorted(exceptions))
     
     if text:
         await message.answer(text)
     else:
-        await message.answer("📝 У вас пока нет ключевых слов или исключений")
+        await message.answer("📝 У вас пока нет ключевых слов или исключений\n\nДобавьте:\n🔍 /add_keyword тест,слово\n🚫 /add_exception спам,реклама")
 
 @dp.message(Command("my_stats"))
 async def cmd_my_stats(message: Message):
@@ -841,8 +907,12 @@ async def cmd_my_alerts(message: Message):
             for chat, user, msg, keywords, time in alerts:
                 time_str = datetime.strptime(time, '%Y-%m-%d %H:%M:%S').strftime('%H:%M')
                 clean_msg = re.sub(r'\*{2,}', '', msg)
+                
+                # Форматируем username с @ для удобного перехода
+                username_display = f"@{user}" if user and user != "Unknown" and user != "N/A" else "Неизвестный"
+                
                 text += f"📱 Чат: {chat}\n"
-                text += f"👤 Юзер: {user or 'N/A'}\n"
+                text += f"👤 Отправитель: {username_display}\n"
                 text += f"🔍 Ключи: {keywords}\n"
                 text += f"💬 Текст: {clean_msg[:60]}...\n"
                 text += f"⏰ Время: {time_str}\n"
@@ -896,7 +966,7 @@ async def start_all_sessions():
                 is_valid, _ = await test_session(session_string)
                 if is_valid:
                     await start_user_session(user_id, session_id, session_name, session_string)
-                    await asyncio.sleep(5)  # Задержка между запусками
+                    # Убрана задержка между запусками для мгновенного старта
                 else:
                     logger.error(f"❌ Невалидная сессия {session_name} для {user_id}")
         
@@ -934,7 +1004,7 @@ async def main():
     # Запуск бота
     await bot.delete_webhook(drop_pending_updates=True)
     
-    # Запуск всех сессий пользователей
+    # Запуск всех сессий пользователей - БЕЗ ЗАДЕРЖЕК!
     asyncio.create_task(start_all_sessions())
     
     logger.info("✅ Бот запущен!")
