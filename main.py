@@ -439,7 +439,7 @@ async def test_session(session_string: str):
     except Exception as e:
         error_msg = str(e)
         if "EOF when reading a line" in error_msg:
-            return False, "❌ Сессия невалидна или устарела. Получите новую сессию через @SessionGeneratorBot"
+            return False, "❌ Сессия невалидна или устарела. Получите новую сессию"
         else:
             return False, f"❌ Ошибка сессии: {error_msg}"
 
@@ -601,7 +601,7 @@ async def cmd_start(message: Message):
     welcome_text = (
         "🔍 Система мониторинга сообщений\n\n"
         "📋 Основные команды:\n"
-        "🔐 /session_data - добавить сессию\n"
+        "🔐 /add_session - добавить сессию\n"
         "📁 /my_sessions - мои сессии\n"
         "▶️ /start_session - запустить мониторинг\n"
         "⏹️ /stop_session - остановить мониторинг\n"
@@ -621,6 +621,42 @@ async def cmd_start(message: Message):
     )
     
     await message.answer(welcome_text)
+
+@dp.message(Command("add_session"))
+async def cmd_add_session(message: Message):
+    """Добавление сессии"""
+    user_id = message.from_user.id
+    
+    if not is_user_allowed(user_id):
+        return
+    
+    args = message.text.split(maxsplit=2)
+    if len(args) < 3:
+        help_text = (
+            "🔐 Добавление сессии для мониторинга\n\n"
+            "Для создания сессии используйте:\n\n"
+            "/add_session название_сессии ваша_строка_сессии\n\n"
+            "Пример:\n"
+            "/add_session моя_сессия 1ApWapzMBu4qU7..."
+        )
+        await message.answer(help_text)
+        return
+    
+    session_name = args[1]
+    session_string = args[2]
+    
+    # Проверяем валидность сессии
+    is_valid, validation_msg = await test_session(session_string)
+    
+    if not is_valid:
+        await message.answer(f"❌ Невалидная сессия: {validation_msg}")
+        return
+    
+    # Сохраняем сессию
+    if save_user_session(user_id, session_name, session_string):
+        await message.answer(f"✅ Сессия '{session_name}' успешно сохранена!\n\nТеперь вы можете запустить мониторинг: /start_session")
+    else:
+        await message.answer("❌ Ошибка сохранения сессии")
 
 @dp.message(Command("keywords"))
 async def cmd_keywords(message: Message):
@@ -736,28 +772,289 @@ async def cmd_clear_exceptions(message: Message):
     else:
         await message.answer("❌ Ошибка при очистке исключений")
 
-@dp.message(Command("session_data"))
-async def cmd_session_data(message: Message):
-    """Добавление сессии (заменил add_session)"""
+@dp.message(Command("add_keyword"))
+async def cmd_add_keyword(message: Message):
+    """Добавление ключевых слов"""
     user_id = message.from_user.id
     
     if not is_user_allowed(user_id):
         return
     
-    help_text = (
-        "🔐 Добавление сессии для мониторинга\n\n"
-        "Для создания сессии используйте нашего бота:\n"
-        "@SessionGeneratorBot\n\n"
-        "После получения строки сессии отправьте команду:\n\n"
-        "/session_data название_сессии ваша_строка_сессии\n\n"
-        "Пример:\n"
-        "/session_data моя_сессия 1ApWapzMBu4qU7..."
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("❌ Используйте: /add_keyword слово1,слово2,слово3")
+        return
+    
+    keywords_text = args[1]
+    added_count, keywords = add_user_keywords(user_id, keywords_text)
+    
+    if added_count > 0:
+        await message.answer(f"✅ Добавлено {added_count} ключевых слов: {', '.join(keywords)}")
+    else:
+        await message.answer("❌ Не удалось добавить ключевые слова")
+
+@dp.message(Command("add_exception"))
+async def cmd_add_exception(message: Message):
+    """Добавление исключений"""
+    user_id = message.from_user.id
+    
+    if not is_user_allowed(user_id):
+        return
+    
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("❌ Используйте: /add_exception слово1,слово2,слово3")
+        return
+    
+    exceptions_text = args[1]
+    added_count, exceptions = add_user_exceptions(user_id, exceptions_text)
+    
+    if added_count > 0:
+        await message.answer(f"✅ Добавлено {added_count} исключений: {', '.join(exceptions)}")
+    else:
+        await message.answer("❌ Не удалось добавить исключения")
+
+@dp.message(Command("my_sessions"))
+async def cmd_my_sessions(message: Message):
+    """Показать список сессий пользователя"""
+    user_id = message.from_user.id
+    
+    if not is_user_allowed(user_id):
+        return
+    
+    sessions = get_user_sessions(user_id)
+    
+    if not sessions:
+        await message.answer("📭 У вас нет сохраненных сессий\n\nДобавьте сессию: /add_session")
+        return
+    
+    text = "📁 Ваши сессии:\n\n"
+    for session_id, session_name, session_string, is_active in sessions:
+        status = "🟢 Активна" if is_active else "🔴 Неактивна"
+        text += f"🆔 {session_id} • {session_name} • {status}\n"
+    
+    text += "\n▶️ Запустить: /start_session <ID>"
+    text += "\n⏹️ Остановить: /stop_session <ID>"
+    
+    await message.answer(text)
+
+@dp.message(Command("start_session"))
+async def cmd_start_session(message: Message):
+    """Запуск сессии по ID"""
+    user_id = message.from_user.id
+    
+    if not is_user_allowed(user_id):
+        return
+    
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("❌ Используйте: /start_session <ID_сессии>\n\nПосмотреть ID: /my_sessions")
+        return
+    
+    try:
+        session_id = int(args[1])
+        sessions = get_user_sessions(user_id)
+        
+        target_session = None
+        for sess in sessions:
+            if sess[0] == session_id:
+                target_session = sess
+                break
+        
+        if not target_session:
+            await message.answer("❌ Сессия с таким ID не найдена")
+            return
+        
+        session_id, session_name, session_string, is_active = target_session
+        
+        # Запускаем сессию
+        success = await start_user_session(user_id, session_id, session_name, session_string)
+        
+        if success:
+            await message.answer(f"✅ Сессия '{session_name}' запущена!")
+        else:
+            await message.answer(f"❌ Не удалось запустить сессию '{session_name}'")
+            
+    except ValueError:
+        await message.answer("❌ Неверный ID. Используйте числовой ID")
+
+@dp.message(Command("stop_session"))
+async def cmd_stop_session(message: Message):
+    """Остановка сессии по ID"""
+    user_id = message.from_user.id
+    
+    if not is_user_allowed(user_id):
+        return
+    
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("❌ Используйте: /stop_session <ID_сессии>\n\nПосмотреть ID: /my_sessions")
+        return
+    
+    try:
+        session_id = int(args[1])
+        success = await stop_user_session(user_id, session_id)
+        
+        if success:
+            await message.answer(f"✅ Сессия ID {session_id} остановлена")
+        else:
+            await message.answer("❌ Не удалось остановить сессию. Возможно, она не запущена")
+            
+    except ValueError:
+        await message.answer("❌ Неверный ID. Используйте числовой ID")
+
+@dp.message(Command("add_user"))
+async def cmd_add_user(message: Message):
+    """Добавление пользователя в белый список (только для админов)"""
+    user_id = message.from_user.id
+    
+    if user_id not in ADMIN_IDS:
+        await message.answer("❌ Недостаточно прав")
+        return
+    
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("❌ Используйте: /add_user <user_id>")
+        return
+    
+    try:
+        new_user_id = int(args[1])
+        username = message.from_user.username or f"user_{new_user_id}"
+        
+        if add_user_to_whitelist(new_user_id, username, user_id):
+            await message.answer(f"✅ Пользователь {new_user_id} добавлен в белый список")
+        else:
+            await message.answer("❌ Ошибка добавления пользователя")
+    except ValueError:
+        await message.answer("❌ Неверный user_id")
+
+@dp.message(Command("users"))
+async def cmd_users(message: Message):
+    """Список пользователей с доступом (только для админов)"""
+    user_id = message.from_user.id
+    
+    if user_id not in ADMIN_IDS:
+        await message.answer("❌ Недостаточно прав")
+        return
+    
+    users = get_allowed_users()
+    
+    if not users:
+        await message.answer("📝 Нет пользователей с доступом")
+        return
+    
+    text = "👥 Пользователи с доступом:\n\n"
+    for user_id, username, first_name, added_at in users:
+        text += f"🆔 {user_id} • @{username} • {first_name}\n"
+        text += f"   📅 Добавлен: {added_at}\n\n"
+    
+    await message.answer(text)
+
+@dp.message(Command("my_stats"))
+async def cmd_my_stats(message: Message):
+    """Статистика пользователя"""
+    user_id = message.from_user.id
+    
+    if not is_user_allowed(user_id):
+        return
+    
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Общая статистика
+        cursor.execute("SELECT COUNT(*) FROM user_messages WHERE user_id = ?", (user_id,))
+        total_messages = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM user_messages WHERE user_id = ? AND has_keywords = 1", (user_id,))
+        alert_messages = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM user_keywords WHERE user_id = ?", (user_id,))
+        total_keywords = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM user_sessions WHERE user_id = ?", (user_id,))
+        total_sessions = cursor.fetchone()[0]
+        
+        # Активные сессии
+        active_sessions = len([key for key in active_clients.keys() if key.startswith(f"{user_id}_")])
+        
+        conn.close()
+        
+        text = (
+            f"📊 Ваша статистика:\n\n"
+            f"💬 Всего сообщений: {total_messages}\n"
+            f"🚨 Сообщений с ключами: {alert_messages}\n"
+            f"🔍 Ключевых слов: {total_keywords}\n"
+            f"📁 Сессий: {total_sessions}\n"
+            f"🟢 Активных сессий: {active_sessions}"
+        )
+        
+        await message.answer(text)
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения статистики: {e}")
+        await message.answer("❌ Ошибка получения статистики")
+
+@dp.message(Command("my_alerts"))
+async def cmd_my_alerts(message: Message):
+    """Последние уведомления пользователя"""
+    user_id = message.from_user.id
+    
+    if not is_user_allowed(user_id):
+        return
+    
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT chat_name, username, keywords_found, message_text, timestamp 
+            FROM user_messages 
+            WHERE user_id = ? AND has_keywords = 1 
+            ORDER BY timestamp DESC 
+            LIMIT 10
+        ''', (user_id,))
+        
+        alerts = cursor.fetchall()
+        conn.close()
+        
+        if not alerts:
+            await message.answer("📭 У вас пока нет уведомлений")
+            return
+        
+        text = "🚨 Последние уведомления:\n\n"
+        for i, (chat_name, username, keywords, message_text, timestamp) in enumerate(alerts, 1):
+            clean_message = re.sub(r'\*{2,}', '', message_text)
+            text += f"{i}. 📱 {chat_name}\n"
+            text += f"   👤 {username}\n"
+            text += f"   🔍 {keywords}\n"
+            text += f"   💬 {clean_message[:50]}...\n"
+            text += f"   🕒 {timestamp}\n\n"
+        
+        await message.answer(text[:4000])  # Ограничение длины
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения уведомлений: {e}")
+        await message.answer("❌ Ошибка получения уведомлений")
+
+@dp.message(Command("status"))
+async def cmd_status(message: Message):
+    """Статус мониторинга"""
+    user_id = message.from_user.id
+    
+    if not is_user_allowed(user_id):
+        return
+    
+    active_user_sessions = len([key for key in active_clients.keys() if key.startswith(f"{user_id}_")])
+    total_active_sessions = len(active_clients)
+    
+    text = (
+        f"📡 Статус мониторинга:\n\n"
+        f"🟢 Ваших активных сессий: {active_user_sessions}\n"
+        f"🌐 Всего активных сессий: {total_active_sessions}\n"
+        f"👤 Ваш ID: {user_id}"
     )
     
-    await message.answer(help_text)
-
-# Остальные команды остаются без изменений...
-# (add_user, users, my_sessions, start_session, stop_session, add_keyword, add_exception, my_stats, my_alerts, status)
+    await message.answer(text)
 
 # Запуск всех сессий при старте бота
 async def start_all_sessions():
