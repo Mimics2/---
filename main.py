@@ -11,6 +11,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from telethon.errors import SessionPasswordNeededError, PhoneNumberInvalidError
 import aiohttp
 from aiohttp import web
 
@@ -37,9 +38,8 @@ bot = Bot(
 )
 dp = Dispatcher()
 
-# Словарь для хранения активных клиентов Telethon и их задач
+# Словарь для хранения активных клиентов Telethon
 active_clients = {}
-client_tasks = {}
 
 def init_db():
     """Инициализация базы данных"""
@@ -111,24 +111,6 @@ def init_db():
             )
         ''')
         
-        # Сообщения пользователей
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS user_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                session_id INTEGER,
-                chat_id TEXT,
-                chat_name TEXT,
-                username TEXT,
-                message_text TEXT,
-                has_keywords BOOLEAN DEFAULT 0,
-                keywords_found TEXT,
-                message_type TEXT,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users (user_id)
-            )
-        ''')
-        
         # Добавляем админов в белый список
         for admin_id in ADMIN_IDS:
             cursor.execute("INSERT OR IGNORE INTO users (user_id, username, first_name) VALUES (?, ?, ?)", 
@@ -159,23 +141,6 @@ def is_user_allowed(user_id: int):
         return result
     except Exception as e:
         logger.error(f"❌ Ошибка проверки доступа для {user_id}: {e}")
-        return False
-
-def add_user_to_whitelist(user_id: int, username: str, added_by: int):
-    """Добавление пользователя в белый список"""
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("INSERT OR IGNORE INTO users (user_id, username, first_name) VALUES (?, ?, ?)", 
-                      (user_id, username, username))
-        cursor.execute("INSERT OR IGNORE INTO allowed_users (user_id, username, added_by) VALUES (?, ?, ?)", 
-                      (user_id, username, added_by))
-        conn.commit()
-        conn.close()
-        logger.info(f"✅ Пользователь {user_id} добавлен в белый список")
-        return True
-    except Exception as e:
-        logger.error(f"❌ Ошибка добавления в белый список {user_id}: {e}")
         return False
 
 def get_user_sessions(user_id: int):
@@ -240,9 +205,7 @@ def get_user_exceptions(user_id: int):
 def save_user_message(user_id: int, message_data: dict):
     """Сохранение сообщения пользователя"""
     try:
-        # Очищаем текст от *** и других нежелательных символов
-        clean_text = re.sub(r'\*{2,}', '', message_data['message_text'])  # Удаляем ***
-        clean_text = re.sub(r'[^\w\sа-яА-ЯёЁ@#.,!?]', '', clean_text)  # Удаляем эмодзи и спецсимволы
+        clean_text = re.sub(r'\*{2,}', '', message_data['message_text'])
         
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -256,7 +219,7 @@ def save_user_message(user_id: int, message_data: dict):
             message_data['chat_id'],
             message_data['chat_name'],
             message_data['username'],
-            clean_text,  # Используем очищенный текст
+            clean_text,
             message_data['has_keywords'],
             message_data['keywords_found'],
             message_data['message_type']
@@ -267,30 +230,50 @@ def save_user_message(user_id: int, message_data: dict):
         logger.error(f"❌ Ошибка сохранения сообщения для {user_id}: {e}")
 
 async def check_keywords_for_user(user_id: int, text: str):
-    """Проверка ключевых слов и исключений для конкретного пользователя"""
+    """Проверка ключевых слов и исключений"""
     if not text:
         return False, []
     
-    # Очищаем текст от *** перед проверкой
     clean_text = re.sub(r'\*{2,}', '', text)
-    
     keywords = get_user_keywords(user_id)
     exceptions = get_user_exceptions(user_id)
     text_lower = clean_text.lower()
     
-    # Проверяем есть ли слова-исключения
+    # Проверяем исключения
     has_exceptions = any(exc in text_lower for exc in exceptions)
     if has_exceptions:
-        return False, []  # Игнорируем сообщение если есть исключения
+        return False, []
     
     # Проверяем ключевые слова
     found_keywords = [kw for kw in keywords if kw in text_lower]
-    
     return len(found_keywords) > 0, found_keywords
+
+async def test_session(session_string: str):
+    """Тестирование сессии перед запуском"""
+    try:
+        client = TelegramClient(
+            StringSession(session_string),
+            api_id=2040,
+            api_hash='b18441a1ff607e10a989891a5462e627'
+        )
+        
+        await client.start()
+        me = await client.get_me()
+        await client.disconnect()
+        
+        return True, f"✅ Сессия валидна: @{me.username}"
+    except Exception as e:
+        return False, f"❌ Ошибка сессии: {str(e)}"
 
 async def start_user_session(user_id: int, session_id: int, session_name: str, session_string: str):
     """Запуск мониторинга для сессии пользователя"""
     try:
+        # Тестируем сессию перед запуском
+        is_valid, message = await test_session(session_string)
+        if not is_valid:
+            await bot.send_message(user_id, f"❌ Не удалось запустить сессию '{session_name}': {message}")
+            return False
+
         # Создаем клиента Telethon
         client = TelegramClient(
             StringSession(session_string),
@@ -300,24 +283,23 @@ async def start_user_session(user_id: int, session_id: int, session_name: str, s
         
         @client.on(events.NewMessage)
         async def handle_user_messages(event):
-            """Обработчик сообщений для конкретного пользователя"""
+            """Обработчик сообщений"""
             try:
-                if not event.message.text or event.message.text.strip() == '':
+                if not event.message.text:
                     return
                 
                 # Получаем информацию о чате
                 chat = await event.get_chat()
                 chat_id = str(chat.id)
-                chat_name = getattr(chat, 'title', f"{getattr(chat, 'first_name', 'Unknown')} {getattr(chat, 'last_name', '')}").strip()
+                chat_name = getattr(chat, 'title', 'Unknown Chat')
                 
                 # Получаем информацию об отправителе
                 sender = await event.get_sender()
-                user_id_str = str(getattr(sender, 'id', 'Unknown'))
                 username = getattr(sender, 'username', 'Unknown')
                 
                 message_text = event.message.text
                 
-                # Проверяем ключевые слова пользователя (учитывая исключения)
+                # Проверяем ключевые слова
                 has_keywords, found_keywords = await check_keywords_for_user(user_id, message_text)
                 
                 # Сохраняем сообщение
@@ -329,60 +311,63 @@ async def start_user_session(user_id: int, session_id: int, session_name: str, s
                     'message_text': message_text,
                     'has_keywords': has_keywords,
                     'keywords_found': ', '.join(found_keywords) if found_keywords else '',
-                    'message_type': 'channel' if hasattr(chat, 'broadcast') and chat.broadcast else 'group'
+                    'message_type': 'channel' if hasattr(chat, 'broadcast') else 'group'
                 }
                 
                 save_user_message(user_id, message_data)
                 
-                # Отправляем уведомление если есть ключевые слова и нет исключений
+                # Отправляем уведомление если есть ключевые слова
                 if has_keywords and found_keywords:
-                    # Очищаем текст для уведомления
                     clean_message = re.sub(r'\*{2,}', '', message_text)
                     
                     alert_text = (
                         f"🚨 Найдено ключевое слово!\n\n"
                         f"📱 Чат: {chat_name}\n"
                         f"👤 Отправитель: {username}\n"
-                        f"🔍 Ключевые слова: {', '.join(found_keywords)}\n"
+                        f"🔍 Ключи: {', '.join(found_keywords)}\n"
                         f"💬 Сообщение: {clean_message[:150]}...\n"
                         f"🔐 Сессия: {session_name}"
                     )
                     
                     try:
                         await bot.send_message(user_id, alert_text)
-                        logger.info(f"🔔 Уведомление отправлено пользователю {user_id}: {found_keywords}")
+                        logger.info(f"🔔 Уведомление отправлено {user_id}: {found_keywords}")
                     except Exception as e:
-                        logger.error(f"❌ Ошибка отправки уведомления пользователю {user_id}: {e}")
+                        logger.error(f"❌ Ошибка отправки: {e}")
                         
             except Exception as e:
-                logger.error(f"❌ Ошибка обработки сообщения для пользователя {user_id}: {e}")
+                logger.error(f"❌ Ошибка обработки сообщения: {e}")
         
-        # Запускаем клиента в отдельной задаче
-        async def run_client():
-            try:
-                await client.start()
-                me = await client.get_me()
-                logger.info(f"✅ Сессия запущена для {user_id}: {session_name} (@{me.username})")
-                await client.run_until_disconnected()
-            except Exception as e:
-                logger.error(f"❌ Ошибка в сессии {session_name}: {e}")
-            finally:
-                # Удаляем из активных при завершении
-                client_key = f"{user_id}_{session_id}"
-                if client_key in active_clients:
-                    del active_clients[client_key]
-                if client_key in client_tasks:
-                    del client_tasks[client_key]
+        # Запускаем клиента
+        await client.start()
+        me = await client.get_me()
         
-        # Сохраняем клиент и запускаем задачу
+        # Сохраняем клиент
         client_key = f"{user_id}_{session_id}"
         active_clients[client_key] = client
-        client_tasks[client_key] = asyncio.create_task(run_client())
         
+        logger.info(f"✅ Сессия запущена для {user_id}: {session_name} (@{me.username})")
+        
+        # Запускаем прослушивание в фоне
+        asyncio.create_task(client.run_until_disconnected())
+        
+        await bot.send_message(user_id, f"✅ Мониторинг запущен для сессии '{session_name}' (@{me.username})")
         return True
         
+    except SessionPasswordNeededError:
+        error_msg = "❌ Сессия требует двухфакторную аутентификацию"
+        await bot.send_message(user_id, error_msg)
+        logger.error(f"❌ 2FA required for {session_name}")
+        return False
+    except PhoneNumberInvalidError:
+        error_msg = "❌ Неверный номер телефона в сессии"
+        await bot.send_message(user_id, error_msg)
+        logger.error(f"❌ Invalid phone for {session_name}")
+        return False
     except Exception as e:
-        logger.error(f"❌ Ошибка запуска сессии для {user_id}: {e}")
+        error_msg = f"❌ Ошибка запуска сессии: {str(e)}"
+        await bot.send_message(user_id, error_msg)
+        logger.error(f"❌ Ошибка запуска {session_name}: {e}")
         return False
 
 async def stop_user_session(user_id: int, session_id: int):
@@ -393,23 +378,13 @@ async def stop_user_session(user_id: int, session_id: int):
         if client_key in active_clients:
             client = active_clients[client_key]
             await client.disconnect()
-            
-            # Отменяем задачу если она существует
-            if client_key in client_tasks:
-                client_tasks[client_key].cancel()
-                try:
-                    await client_tasks[client_key]
-                except asyncio.CancelledError:
-                    pass
-                del client_tasks[client_key]
-            
             del active_clients[client_key]
             logger.info(f"⏹️ Сессия остановлена: {client_key}")
             return True
         
         return False
     except Exception as e:
-        logger.error(f"❌ Ошибка остановки сессии {user_id}_{session_id}: {e}")
+        logger.error(f"❌ Ошибка остановки сессии: {e}")
         return False
 
 # Middleware для проверки доступа
@@ -418,7 +393,7 @@ async def check_access_middleware(handler, event: Message, data):
     """Проверка доступа пользователя"""
     user_id = event.from_user.id
     
-    # Автоматически добавляем пользователя при первом обращении
+    # Автоматически добавляем пользователя
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -427,9 +402,9 @@ async def check_access_middleware(handler, event: Message, data):
         conn.commit()
         conn.close()
     except Exception as e:
-        logger.error(f"❌ Ошибка добавления пользователя {user_id}: {e}")
+        logger.error(f"❌ Ошибка добавления пользователя: {e}")
     
-    # Проверяем доступ для всех команд кроме start
+    # Проверяем доступ для команд кроме start
     if event.text and not event.text.startswith('/start'):
         if not is_user_allowed(user_id):
             await event.answer("❌ Доступ запрещен. Обратитесь к администратору.")
@@ -459,56 +434,6 @@ async def cmd_start(message: Message):
     
     await message.answer(welcome_text)
 
-@dp.message(Command("add_user"))
-async def cmd_add_user(message: Message):
-    user_id = message.from_user.id
-    
-    # Проверяем права администратора
-    if user_id not in ADMIN_IDS:
-        await message.answer("❌ Недостаточно прав")
-        return
-    
-    args = message.text.split()
-    if len(args) < 2:
-        await message.answer("📝 Используйте: /add_user user_id")
-        return
-    
-    try:
-        target_user_id = int(args[1])
-        if add_user_to_whitelist(target_user_id, f"user_{target_user_id}", user_id):
-            await message.answer(f"✅ Пользователь {target_user_id} добавлен в белый список")
-        else:
-            await message.answer("❌ Ошибка добавления пользователя")
-    except ValueError:
-        await message.answer("❌ Неверный user_id")
-
-@dp.message(Command("users"))
-async def cmd_users(message: Message):
-    user_id = message.from_user.id
-    
-    if user_id not in ADMIN_IDS:
-        await message.answer("❌ Недостаточно прав")
-        return
-    
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT user_id, username FROM allowed_users")
-        users = cursor.fetchall()
-        conn.close()
-        
-        if users:
-            text = "👥 Пользователи с доступом:\n\n"
-            for user_id, username in users:
-                status = "🟢" if any(str(user_id) in key for key in active_clients.keys()) else "⚪"
-                text += f"{status} {user_id} - {username}\n"
-            await message.answer(text)
-        else:
-            await message.answer("📝 Пользователи не найдены")
-    except Exception as e:
-        logger.error(f"❌ Ошибка получения пользователей: {e}")
-        await message.answer("❌ Ошибка получения списка")
-
 @dp.message(Command("add_session"))
 async def cmd_add_session(message: Message):
     user_id = message.from_user.id
@@ -519,7 +444,7 @@ async def cmd_add_session(message: Message):
     help_text = (
         "🔐 Добавление сессии для мониторинга\n\n"
         "Для создания сессии используйте нашего бота:\n"
-        "@testses_ses_bot\n\n"
+        "@SessionGeneratorBot\n\n"
         "После получения строки сессии отправьте команду:\n\n"
         "/session_data название_сессии ваша_строка_сессии\n\n"
         "Пример:\n"
@@ -547,17 +472,24 @@ async def cmd_session_data(message: Message):
         await message.answer("❌ Неверная строка сессии")
         return
     
-    if save_user_session(user_id, session_name, session_string):
-        response_text = (
-            f"✅ Сессия добавлена!\n\n"
-            f"📝 Название: {session_name}\n"
-            f"💾 Статус: Сохранена\n\n"
-            f"Запустите мониторинг:\n"
-            f"▶️ /start_session {session_name}"
-        )
-        await message.answer(response_text)
+    # Тестируем сессию перед сохранением
+    await message.answer("🔍 Проверяю сессию...")
+    is_valid, test_result = await test_session(session_string)
+    
+    if is_valid:
+        if save_user_session(user_id, session_name, session_string):
+            response_text = (
+                f"✅ Сессия добавлена!\n\n"
+                f"📝 Название: {session_name}\n"
+                f"{test_result}\n\n"
+                f"Запустите мониторинг:\n"
+                f"▶️ /start_session {session_name}"
+            )
+            await message.answer(response_text)
+        else:
+            await message.answer("❌ Ошибка при сохранении сессии")
     else:
-        await message.answer("❌ Ошибка при сохранении сессии")
+        await message.answer(f"❌ Неверная сессия:\n{test_result}")
 
 @dp.message(Command("my_sessions"))
 async def cmd_my_sessions(message: Message):
@@ -578,7 +510,6 @@ async def cmd_my_sessions(message: Message):
         is_running = client_key in active_clients
         
         status = "🟢 Запущена" if is_running else "⚪ Остановлена"
-        session_preview = session_string[:20] + "..." if len(session_string) > 20 else session_string
         
         text += f"📝 {session_name}\n"
         text += f"🆔 ID: {session_id}\n"
@@ -620,21 +551,17 @@ async def cmd_start_session(message: Message):
     
     session_id, session_name, session_string = target_session
     
+    # Проверяем не запущена ли уже сессия
+    client_key = f"{user_id}_{session_id}"
+    if client_key in active_clients:
+        await message.answer(f"✅ Сессия '{session_name}' уже запущена")
+        return
+    
+    await message.answer(f"🔍 Запускаю сессию '{session_name}'...")
     success = await start_user_session(user_id, session_id, session_name, session_string)
     
-    if success:
-        response_text = (
-            f"✅ Мониторинг запущен!\n\n"
-            f"📝 Сессия: {session_name}\n"
-            f"🆔 ID: {session_id}\n"
-            f"📡 Статус: Активен\n\n"
-            f"🔍 Бот отслеживает все сообщения\n"
-            f"🚨 Уведомляет о ключевых словах\n"
-            f"🚫 Игнорирует сообщения с исключениями"
-        )
-        await message.answer(response_text)
-    else:
-        await message.answer("❌ Ошибка запуска сессии")
+    if not success:
+        await message.answer(f"❌ Не удалось запустить сессию '{session_name}'")
 
 @dp.message(Command("stop_session"))
 async def cmd_stop_session(message: Message):
@@ -684,10 +611,8 @@ async def cmd_add_keyword(message: Message):
         conn.close()
         
         await message.answer(f"✅ Ключевое слово добавлено: {keyword}")
-        logger.info(f"🔍 Пользователь {user_id} добавил ключевое слово: {keyword}")
         
     except Exception as e:
-        logger.error(f"❌ Ошибка добавления ключевого слова для {user_id}: {e}")
         await message.answer("❌ Ошибка при добавлении")
 
 @dp.message(Command("add_exception"))
@@ -715,10 +640,8 @@ async def cmd_add_exception(message: Message):
         conn.close()
         
         await message.answer(f"✅ Исключение добавлено: {exception_word}")
-        logger.info(f"🚫 Пользователь {user_id} добавил исключение: {exception_word}")
         
     except Exception as e:
-        logger.error(f"❌ Ошибка добавления исключения для {user_id}: {e}")
         await message.answer("❌ Ошибка при добавлении")
 
 @dp.message(Command("my_keywords"))
@@ -741,7 +664,7 @@ async def cmd_my_keywords(message: Message):
     if text:
         await message.answer(text)
     else:
-        await message.answer("📝 У вас пока нет ключевых слов или исключений\n\nДобавьте: 🔍 /add_keyword или 🚫 /add_exception")
+        await message.answer("📝 У вас пока нет ключевых слов или исключений")
 
 @dp.message(Command("my_stats"))
 async def cmd_my_stats(message: Message):
@@ -763,17 +686,7 @@ async def cmd_my_stats(message: Message):
         cursor.execute("SELECT COUNT(*) FROM user_sessions WHERE user_id = ?", (user_id,))
         sessions_count = cursor.fetchone()[0]
         
-        cursor.execute("SELECT COUNT(*) FROM user_messages WHERE user_id = ?", (user_id,))
-        messages_count = cursor.fetchone()[0]
-        
-        cursor.execute("SELECT COUNT(*) FROM user_messages WHERE user_id = ? AND has_keywords = 1", (user_id,))
-        alerts_count = cursor.fetchone()[0]
-        
-        cursor.execute(
-            "SELECT keywords_found, COUNT(*) FROM user_messages WHERE user_id = ? AND has_keywords = 1 GROUP BY keywords_found ORDER BY COUNT(*) DESC LIMIT 5",
-            (user_id,)
-        )
-        top_keywords = cursor.fetchall()
+        active_sessions = sum(1 for key in active_clients.keys() if key.startswith(f"{user_id}_"))
         
         conn.close()
         
@@ -781,61 +694,33 @@ async def cmd_my_stats(message: Message):
             f"📊 Ваша статистика\n\n"
             f"🔍 Ключевых слов: {kw_count}\n"
             f"🚫 Исключений: {exc_count}\n"
-            f"🔐 Сессий: {sessions_count}\n"
-            f"💬 Всего сообщений: {messages_count}\n"
-            f"🚨 Найдено совпадений: {alerts_count}\n"
+            f"🔐 Всего сессий: {sessions_count}\n"
+            f"🟢 Активных сессий: {active_sessions}\n"
         )
-        
-        if top_keywords:
-            stats_text += "\n🏆 Топ ключевых слов:\n"
-            for keyword, count in top_keywords:
-                stats_text += f"• {keyword}: {count}\n"
         
         await message.answer(stats_text)
         
     except Exception as e:
-        logger.error(f"❌ Ошибка получения статистики для {user_id}: {e}")
         await message.answer("❌ Ошибка получения статистики")
 
-@dp.message(Command("my_alerts"))
-async def cmd_my_alerts(message: Message):
+@dp.message(Command("status"))
+async def cmd_status(message: Message):
+    """Проверка статуса мониторинга"""
     user_id = message.from_user.id
     
     if not is_user_allowed(user_id):
         return
     
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT chat_name, username, message_text, keywords_found, timestamp 
-            FROM user_messages 
-            WHERE user_id = ? AND has_keywords = 1
-            ORDER BY timestamp DESC 
-            LIMIT 10
-        """, (user_id,))
-        alerts = cursor.fetchall()
-        conn.close()
-        
-        if alerts:
-            text = "🚨 Последние уведомления:\n\n"
-            for chat, user, msg, keywords, time in alerts:
-                time_str = datetime.strptime(time, '%Y-%m-%d %H:%M:%S').strftime('%H:%M')
-                # Очищаем текст от ***
-                clean_msg = re.sub(r'\*{2,}', '', msg)
-                text += f"📱 Чат: {chat}\n"
-                text += f"👤 Юзер: {user or 'N/A'}\n"
-                text += f"🔍 Ключи: {keywords}\n"
-                text += f"💬 Текст: {clean_msg[:60]}...\n"
-                text += f"⏰ Время: {time_str}\n"
-                text += "──────\n"
-            await message.answer(text)
-        else:
-            await message.answer("📝 У вас пока нет уведомлений")
-            
-    except Exception as e:
-        logger.error(f"❌ Ошибка получения уведомлений для {user_id}: {e}")
-        await message.answer("❌ Ошибка получения уведомлений")
+    active_sessions = []
+    for key in active_clients.keys():
+        if key.startswith(f"{user_id}_"):
+            session_id = key.split('_')[1]
+            active_sessions.append(session_id)
+    
+    if active_sessions:
+        await message.answer(f"✅ Мониторинг активен\n🟢 Сессии: {', '.join(active_sessions)}")
+    else:
+        await message.answer("❌ Мониторинг не активен\nЗапустите сессию: ▶️ /start_session")
 
 # Запуск всех сессий при старте бота
 async def start_all_sessions():
@@ -851,11 +736,16 @@ async def start_all_sessions():
             sessions = cursor.fetchall()
             
             for session_id, session_name, session_string in sessions:
-                await start_user_session(user_id, session_id, session_name, session_string)
-                await asyncio.sleep(2)  # Увеличиваем задержку между запусками
+                # Проверяем сессию перед запуском
+                is_valid, _ = await test_session(session_string)
+                if is_valid:
+                    await start_user_session(user_id, session_id, session_name, session_string)
+                    await asyncio.sleep(5)  # Задержка между запусками
+                else:
+                    logger.error(f"❌ Невалидная сессия {session_name} для {user_id}")
         
         conn.close()
-        logger.info("✅ Все сессии пользователей запущены")
+        logger.info("✅ Все валидные сессии запущены")
         
     except Exception as e:
         logger.error(f"❌ Ошибка запуска сессий при старте: {e}")
