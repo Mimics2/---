@@ -14,7 +14,6 @@ from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError, PhoneNumberInvalidError
 import aiohttp
 from aiohttp import web
-from collections import defaultdict
 import time
 
 # Конфигурация для Railway
@@ -43,58 +42,26 @@ dp = Dispatcher()
 # Словарь для хранения активных клиентов Telethon
 active_clients = {}
 
-# Словари для управления флуд-контролем
+# Простой флуд-контроль
 user_last_message = {}
-user_queues = defaultdict(asyncio.Queue)
-user_workers = {}
-
-async def user_message_worker(user_id: int):
-    """Воркер для обработки сообщений конкретного пользователя"""
-    while True:
-        try:
-            text, reply_markup = await user_queues[user_id].get()
-            
-            # Проверяем время последнего сообщения пользователю
-            current_time = time.time()
-            last_time = user_last_message.get(user_id, 0)
-            
-            # Минимальная задержка 0.5 секунды между сообщениями одному пользователю
-            time_since_last = current_time - last_time
-            if time_since_last < 0.5:
-                await asyncio.sleep(0.5 - time_since_last)
-            
-            try:
-                await bot.send_message(user_id, text, reply_markup=reply_markup, parse_mode=None)
-                user_last_message[user_id] = time.time()
-                logger.debug(f"📤 Сообщение отправлено пользователю {user_id}")
-            except Exception as e:
-                logger.error(f"❌ Ошибка отправки сообщения {user_id}: {e}")
-            
-            user_queues[user_id].task_done()
-            await asyncio.sleep(0.05)  # Минимальная задержка между сообщениями
-            
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.error(f"❌ Ошибка в user_message_worker для {user_id}: {e}")
-            await asyncio.sleep(1)
 
 async def safe_send_message(user_id: int, text: str, reply_markup=None):
-    """Безопасная отправка сообщения с очередью для каждого пользователя"""
+    """Безопасная отправка сообщения с базовым флуд-контролем"""
     try:
-        # Очищаем текст от HTML тегов для обычного режима
-        clean_text = re.sub(r'<[^>]+>', '', text)
+        current_time = time.time()
+        last_time = user_last_message.get(user_id, 0)
         
-        # Запускаем воркер для пользователя, если его нет
-        if user_id not in user_workers:
-            user_workers[user_id] = asyncio.create_task(user_message_worker(user_id))
-            logger.debug(f"🚀 Запущен воркер для пользователя {user_id}")
+        # Задержка 1 секунда между сообщениями одному пользователю
+        time_since_last = current_time - last_time
+        if time_since_last < 1:
+            await asyncio.sleep(1 - time_since_last)
         
-        # Добавляем сообщение в очередь пользователя
-        await user_queues[user_id].put((clean_text, reply_markup))
+        await bot.send_message(user_id, text, reply_markup=reply_markup, parse_mode=None)
+        user_last_message[user_id] = time.time()
+        logger.debug(f"📤 Сообщение отправлено пользователю {user_id}")
         
     except Exception as e:
-        logger.error(f"❌ Ошибка добавления в очередь для {user_id}: {e}")
+        logger.error(f"❌ Ошибка отправки сообщения {user_id}: {e}")
 
 def init_db():
     """Инициализация базы данных"""
@@ -1164,28 +1131,6 @@ async def start_http_server():
     await site.start()
     logger.info(f"🌐 HTTP сервер запущен на порту {PORT}")
 
-async def cleanup_workers():
-    """Очистка неиспользуемых воркеров"""
-    while True:
-        await asyncio.sleep(300)  # Проверяем каждые 5 минут
-        try:
-            current_time = time.time()
-            users_to_remove = []
-            
-            for user_id, worker in user_workers.items():
-                # Если очередь пуста и прошло больше 10 минут с последнего сообщения
-                if user_queues[user_id].empty() and current_time - user_last_message.get(user_id, 0) > 600:
-                    worker.cancel()
-                    users_to_remove.append(user_id)
-                    logger.debug(f"🧹 Остановлен воркер для пользователя {user_id}")
-            
-            for user_id in users_to_remove:
-                del user_workers[user_id]
-                del user_queues[user_id]
-                
-        except Exception as e:
-            logger.error(f"❌ Ошибка очистки воркеров: {e}")
-
 async def main():
     """Основная функция запуска"""
     logger.info("🚀 Запуск системы мониторинга...")
@@ -1196,14 +1141,11 @@ async def main():
     # Запуск HTTP сервера
     await start_http_server()
     
-    # Запуск очистки воркеров
-    asyncio.create_task(cleanup_workers())
-    
     # Запуск бота
     await bot.delete_webhook(drop_pending_updates=True)
     
     # Запуск всех сессий пользователей с задержкой
-    await asyncio.sleep(5)  # Даем боту время запуститься
+    await asyncio.sleep(3)  # Даем боту время запуститься
     asyncio.create_task(start_all_sessions())
     
     logger.info("✅ Бот запущен!")
