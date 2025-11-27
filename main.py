@@ -51,10 +51,10 @@ async def safe_send_message(user_id: int, text: str, reply_markup=None):
         current_time = time.time()
         last_time = user_last_message.get(user_id, 0)
         
-        # Задержка 1 секунда между сообщениями одному пользователю
+        # Задержка 0.5 секунды между сообщениями одному пользователю
         time_since_last = current_time - last_time
-        if time_since_last < 1:
-            await asyncio.sleep(1 - time_since_last)
+        if time_since_last < 0.5:
+            await asyncio.sleep(0.5 - time_since_last)
         
         await bot.send_message(user_id, text, reply_markup=reply_markup, parse_mode=None)
         user_last_message[user_id] = time.time()
@@ -479,6 +479,65 @@ async def test_session(session_string: str):
         else:
             return False, f"❌ Ошибка сессии: {error_msg}"
 
+async def process_message_for_user(user_id: int, session_id: int, session_name: str, event):
+    """Обработка сообщения для пользователя (вынесено в отдельную функцию)"""
+    try:
+        if not event.message.text:
+            return
+        
+        # Получаем информацию о чате
+        chat = await event.get_chat()
+        chat_id = str(chat.id)
+        chat_name = getattr(chat, 'title', 'Unknown Chat')
+        
+        # Получаем информацию об отправителе
+        sender = await event.get_sender()
+        username = getattr(sender, 'username', 'Unknown')
+        
+        message_text = event.message.text
+        
+        # Проверяем ключевые слова
+        has_keywords, found_keywords = await check_keywords_for_user(user_id, message_text)
+        
+        # Сохраняем сообщение
+        message_data = {
+            'session_id': session_id,
+            'chat_id': chat_id,
+            'chat_name': chat_name,
+            'username': username,
+            'message_text': message_text,
+            'has_keywords': has_keywords,
+            'keywords_found': ', '.join(found_keywords) if found_keywords else '',
+            'message_type': 'channel' if hasattr(chat, 'broadcast') else 'group'
+        }
+        
+        save_user_message(user_id, message_data)
+        
+        # Отправляем уведомление если есть ключевые слова
+        if has_keywords and found_keywords:
+            clean_message = re.sub(r'\*{2,}', '', message_text)
+            
+            # Форматируем username с @ для удобного перехода
+            username_display = f"@{username}" if username and username != "Unknown" else "Неизвестный"
+            
+            alert_text = (
+                f"🚨 Найдено ключевое слово!\n\n"
+                f"📱 Чат: {chat_name}\n"
+                f"👤 Отправитель: {username_display}\n"
+                f"🔍 Ключи: {', '.join(found_keywords)}\n"
+                f"💬 Сообщение: {clean_message[:150]}...\n"
+                f"🔐 Сессия: {session_name}"
+            )
+            
+            try:
+                await safe_send_message(user_id, alert_text)
+                logger.info(f"🔔 Уведомление отправлено {user_id}: {found_keywords}")
+            except Exception as e:
+                logger.error(f"❌ Ошибка отправки: {e}")
+                    
+    except Exception as e:
+        logger.error(f"❌ Ошибка обработки сообщения: {e}")
+
 async def start_user_session(user_id: int, session_id: int, session_name: str, session_string: str):
     """Запуск мониторинга для сессии пользователя"""
     try:
@@ -497,78 +556,34 @@ async def start_user_session(user_id: int, session_id: int, session_name: str, s
         
         @client.on(events.NewMessage)
         async def handle_user_messages(event):
-            """Обработчик сообщений"""
+            """Обработчик сообщений - только добавляет задачу в event loop"""
+            # Создаем задачу для обработки сообщения, не блокируя основной поток
+            asyncio.create_task(
+                process_message_for_user(user_id, session_id, session_name, event)
+            )
+        
+        # Запускаем клиента в отдельной задаче
+        async def run_client():
             try:
-                if not event.message.text:
-                    return
+                await client.start()
+                me = await client.get_me()
                 
-                # Получаем информацию о чате
-                chat = await event.get_chat()
-                chat_id = str(chat.id)
-                chat_name = getattr(chat, 'title', 'Unknown Chat')
+                # Сохраняем клиент
+                client_key = f"{user_id}_{session_id}"
+                active_clients[client_key] = client
                 
-                # Получаем информацию об отправителе
-                sender = await event.get_sender()
-                username = getattr(sender, 'username', 'Unknown')
+                logger.info(f"✅ Сессия запущена для {user_id}: {session_name} (@{me.username})")
+                await safe_send_message(user_id, f"✅ Мониторинг запущен для сессии '{session_name}' (@{me.username})")
                 
-                message_text = event.message.text
+                # Запускаем прослушивание
+                await client.run_until_disconnected()
                 
-                # Проверяем ключевые слова
-                has_keywords, found_keywords = await check_keywords_for_user(user_id, message_text)
-                
-                # Сохраняем сообщение
-                message_data = {
-                    'session_id': session_id,
-                    'chat_id': chat_id,
-                    'chat_name': chat_name,
-                    'username': username,
-                    'message_text': message_text,
-                    'has_keywords': has_keywords,
-                    'keywords_found': ', '.join(found_keywords) if found_keywords else '',
-                    'message_type': 'channel' if hasattr(chat, 'broadcast') else 'group'
-                }
-                
-                save_user_message(user_id, message_data)
-                
-                # Отправляем уведомление если есть ключевые слова
-                if has_keywords and found_keywords:
-                    clean_message = re.sub(r'\*{2,}', '', message_text)
-                    
-                    # Форматируем username с @ для удобного перехода
-                    username_display = f"@{username}" if username and username != "Unknown" else "Неизвестный"
-                    
-                    alert_text = (
-                        f"🚨 Найдено ключевое слово!\n\n"
-                        f"📱 Чат: {chat_name}\n"
-                        f"👤 Отправитель: {username_display}\n"
-                        f"🔍 Ключи: {', '.join(found_keywords)}\n"
-                        f"💬 Сообщение: {clean_message[:150]}...\n"
-                        f"🔐 Сессия: {session_name}"
-                    )
-                    
-                    try:
-                        await safe_send_message(user_id, alert_text)
-                        logger.info(f"🔔 Уведомление отправлено {user_id}: {found_keywords}")
-                    except Exception as e:
-                        logger.error(f"❌ Ошибка отправки: {e}")
-                        
             except Exception as e:
-                logger.error(f"❌ Ошибка обработки сообщения: {e}")
+                logger.error(f"❌ Ошибка в клиенте {session_name}: {e}")
+                await safe_send_message(user_id, f"❌ Ошибка в сессии '{session_name}': {str(e)}")
         
-        # Запускаем клиента
-        await client.start()
-        me = await client.get_me()
-        
-        # Сохраняем клиент
-        client_key = f"{user_id}_{session_id}"
-        active_clients[client_key] = client
-        
-        logger.info(f"✅ Сессия запущена для {user_id}: {session_name} (@{me.username})")
-        
-        # Запускаем прослушивание в фоне
-        asyncio.create_task(client.run_until_disconnected())
-        
-        await safe_send_message(user_id, f"✅ Мониторинг запущен для сессии '{session_name}' (@{me.username})")
+        # Запускаем клиента в фоне
+        asyncio.create_task(run_client())
         return True
         
     except SessionPasswordNeededError:
@@ -629,7 +644,7 @@ async def check_access_middleware(handler, event: Message, data):
     
     return await handler(event, data)
 
-# Команды бота
+# Команды бота (остаются без изменений)
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     user_id = message.from_user.id
@@ -1105,8 +1120,11 @@ async def start_all_sessions():
                 # Проверяем сессию перед запуском
                 is_valid, _ = await test_session(session_string)
                 if is_valid:
-                    await start_user_session(user_id, session_id, session_name, session_string)
-                    await asyncio.sleep(2)  # Задержка между запусками сессий
+                    # Запускаем каждую сессию в отдельной задаче с задержкой
+                    asyncio.create_task(
+                        start_user_session(user_id, session_id, session_name, session_string)
+                    )
+                    await asyncio.sleep(3)  # Задержка между запусками сессий
                 else:
                     logger.error(f"❌ Невалидная сессия {session_name} для {user_id}")
         
